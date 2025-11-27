@@ -1,6 +1,7 @@
 use std::{
     cmp::Ordering,
     collections::{BinaryHeap, HashMap},
+    fmt::Display,
 };
 
 use clap::Parser;
@@ -27,7 +28,7 @@ use vortex::{
 struct Opt {
     #[arg(long, short = 'n', default_value_t = 1_000)]
     rows: usize,
-    #[arg(long, short = 'd', default_value_t = 8)]
+    #[arg(long, short = 'd', default_value_t = 512)]
     dimension: usize,
     #[arg(long, short = 'k', default_value_t = 10)]
     top_k: usize,
@@ -180,36 +181,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let s = results.to_struct();
     let ids = s.field_by_name("id")?.to_varbinview();
+    let vectors = s.field_by_name("vector");
+    let rand_floats = s.field_by_name("rand_float");
 
-    for i in 0..s.len() {
-        let mut result_string = String::new();
+    let mut results = (0..s.len())
+        .map(|i| {
+            let id_scalar = ids.scalar_at(i);
+            let id_utf8_value = id_scalar.as_utf8().value().unwrap();
+            let id = id_utf8_value.as_str().to_string();
 
-        let id_scalar = ids.scalar_at(i);
-        let id_utf8_value = id_scalar.as_utf8().value().unwrap();
-        let id = id_utf8_value.as_str();
-        result_string.push_str(&format!("id={}", id));
+            let distance = *id_to_distance.get(&id).unwrap();
 
-        let distance = id_to_distance.get(id).unwrap();
-        result_string.push_str(&format!(" distance={}", distance));
+            let vector = opt.include_values.then(|| {
+                let vectors = vectors.as_ref().unwrap().to_fixed_size_list();
+                vectors.fixed_size_list_elements_at(i).to_primitive()
+            });
 
-        if opt.include_values {
-            let vectors = s.field_by_name("vector")?.to_listview();
-            let vector = vectors.list_elements_at(i).to_primitive();
-            let vector = vector.display_values();
-            result_string.push_str(&format!(" values={}", vector));
-        }
+            let metadata = opt.include_metadata.then(|| {
+                let rand_floats = rand_floats.as_ref().unwrap().to_primitive();
+                rand_floats
+                    .scalar_at(i)
+                    .as_primitive()
+                    .typed_value()
+                    .unwrap()
+            });
 
-        if opt.include_metadata {
-            let rand_floats = s.field_by_name("rand_float")?.to_primitive();
-            let rand_float: f64 = rand_floats
-                .scalar_at(i)
-                .as_primitive()
-                .typed_value()
-                .unwrap();
-            result_string.push_str(&format!(" metadata={:?}", rand_float));
-        }
+            ResultElement {
+                id,
+                distance,
+                vector,
+                metadata,
+            }
+        })
+        .collect::<Vec<_>>();
 
-        println!("{}", result_string);
+    results.sort_by_key(|r| r.distance);
+
+    for result in results {
+        println!("{}", result);
     }
 
     Ok(())
@@ -225,5 +234,25 @@ struct HeapElement {
 impl PartialOrd for HeapElement {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.distance.cmp(&other.distance))
+    }
+}
+
+struct ResultElement {
+    id: String,
+    distance: usize,
+    vector: Option<PrimitiveArray>,
+    metadata: Option<f64>,
+}
+
+impl Display for ResultElement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "id={} distance={}", self.id, self.distance)?;
+        if let Some(vector) = self.vector.as_ref() {
+            write!(f, " values={}", vector.display_values())?;
+        }
+        if let Some(metadata) = self.metadata {
+            write!(f, " metadata={}", metadata)?;
+        }
+        Ok(())
     }
 }
