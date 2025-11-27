@@ -9,13 +9,15 @@ use rand::{Rng, rng};
 use uuid::Uuid;
 use vortex::{
     ArraySession, IntoArray, ToCanonical,
-    arrays::{BoolArray, ListArray, PrimitiveArray, StructArray, VarBinViewArray},
-    buffer::Buffer,
-    expr::{col, eq, lit, lt, or_collect, root, select},
+    arrays::{BoolArray, FixedSizeListArray, PrimitiveArray, StructArray, VarBinViewArray},
+    compute::{Operator, compare},
+    dtype::Nullability,
+    expr::{col, list_contains, lit, lt, root, select},
     file::{OpenOptionsSessionExt, WriteOptionsSessionExt},
     io::session::RuntimeSession,
     layout::session::LayoutSession,
     metrics::VortexMetrics,
+    scalar::Scalar,
     session::VortexSession,
     stream::ArrayStreamExt,
     validity::Validity,
@@ -23,7 +25,7 @@ use vortex::{
 
 #[derive(Debug, Parser)]
 struct Opt {
-    #[arg(long, short = 'n', default_value_t = 100)]
+    #[arg(long, short = 'n', default_value_t = 1_000)]
     rows: usize,
     #[arg(long, short = 'd', default_value_t = 8)]
     dimension: usize,
@@ -49,31 +51,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let ids = VarBinViewArray::from_iter_str((0..opt.rows).map(|_| Uuid::new_v4().to_string()));
 
-    let elements = PrimitiveArray::from_iter(
-        (0..opt.rows * opt.dimension).map(|_| rng().random_range(-1.0..1.0)),
-    );
-    let offsets = Buffer::from_iter((0..=opt.rows).scan(0, |acc, _| {
-        let cur = *acc;
-        *acc += opt.dimension;
-        Some(cur as u32)
-    }));
-    let vectors = ListArray::try_new(
-        elements.into_array(),
-        offsets.into_array(),
+    let vectors = FixedSizeListArray::try_new(
+        PrimitiveArray::from_iter(
+            (0..opt.rows * opt.dimension).map(|_| rng().random_range(-1.0..1.0)),
+        )
+        .into_array(),
+        opt.dimension as u32,
         Validity::NonNullable,
+        opt.rows,
     )?;
 
-    let elements =
-        BoolArray::from_iter((0..opt.rows * opt.dimension).map(|_| rng().random_bool(0.5)));
-    let offsets = Buffer::from_iter((0..=opt.rows).scan(0, |acc, _| {
-        let cur = *acc;
-        *acc += opt.dimension;
-        Some(cur as u32)
-    }));
-    let projections = ListArray::try_new(
-        elements.into_array(),
-        offsets.into_array(),
+    let projections = FixedSizeListArray::try_new(
+        BoolArray::from_iter((0..opt.rows * opt.dimension).map(|_| rng().random_bool(0.5)))
+            .into_array(),
+        opt.dimension as u32,
         Validity::NonNullable,
+        opt.rows,
     )?;
 
     let rand_floats =
@@ -112,21 +105,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let s = array.to_struct();
         let ids = s.field_by_name("id")?.to_varbinview();
-        let projections = s.field_by_name("projection")?.to_listview();
+        let projections = s.field_by_name("projection")?.to_fixed_size_list();
 
         let len = ids.len();
 
         for i in 0..len {
-            let id_scalar = ids.scalar_at(i);
-            let id_utf8_value = id_scalar.as_utf8().value().unwrap();
-            let id = id_utf8_value.as_str();
-            let projection_array = projections.list_elements_at(i);
+            let id = ids.scalar_at(i);
+            let id = id.as_utf8().value().unwrap();
+            let id = id.as_str();
+
+            let projection_array = projections.fixed_size_list_elements_at(i);
             let projection = projection_array.to_bool();
 
-            // TODO: Is there a more efficient way to do zip/map/filter?
-            let distance = (0..opt.dimension)
-                .filter(|&j| query_projection.scalar_at(j) != projection.scalar_at(j))
-                .count();
+            let distance = compare(
+                query_projection.as_ref(),
+                projection.as_ref(),
+                Operator::NotEq,
+            )?
+            .to_bool()
+            .as_bool_typed()
+            .true_count()?;
 
             if heap.len() < opt.top_k {
                 heap.push(HeapElement {
@@ -153,8 +151,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|h| (h.id.clone(), h.distance))
         .collect::<HashMap<_, _>>();
 
-    let top_k_ids = top_k.keys().cloned().collect::<Vec<_>>();
-
     let mut projection_mask = vec!["id"];
     if opt.include_values {
         projection_mask.push("vector");
@@ -163,12 +159,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         projection_mask.push("rand_float");
     }
 
+    let filter = if top_k.is_empty() {
+        lit(false)
+    } else {
+        let scalars = top_k
+            .keys()
+            .map(|id| Scalar::from(id.as_str()))
+            .collect::<Vec<_>>();
+        let list = Scalar::list(
+            scalars.first().unwrap().dtype().clone(),
+            scalars,
+            Nullability::NonNullable,
+        );
+        list_contains(lit(list), col("id"))
+    };
+
     let results = file
         .scan()?
-        // TODO: Is there a more efficient way to do a select-in filter?
-        .with_filter(
-            or_collect(top_k_ids.iter().map(|id| eq(col("id"), lit(id.as_str())))).unwrap(),
-        )
+        .with_filter(filter)
         .with_projection(select(projection_mask.as_slice(), root()))
         .into_array_stream()?
         .read_all()
