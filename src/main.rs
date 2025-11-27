@@ -10,14 +10,14 @@ use uuid::Uuid;
 use vortex::{
     ArraySession, IntoArray, ToCanonical,
     arrays::{BoolArray, FixedSizeListArray, PrimitiveArray, StructArray, VarBinViewArray},
+    buffer::Buffer,
     compute::{Operator, compare},
-    dtype::Nullability,
-    expr::{col, list_contains, lit, lt, root, select},
+    expr::{col, lit, lt, root, select},
     file::{OpenOptionsSessionExt, WriteOptionsSessionExt},
     io::session::RuntimeSession,
     layout::session::LayoutSession,
     metrics::VortexMetrics,
-    scalar::Scalar,
+    scan::Selection,
     session::VortexSession,
     stream::ArrayStreamExt,
     validity::Validity,
@@ -49,6 +49,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     vortex::file::register_default_encodings(&session);
 
+    let indices = PrimitiveArray::from_iter(0..opt.rows as u64);
+
     let ids = VarBinViewArray::from_iter_str((0..opt.rows).map(|_| Uuid::new_v4().to_string()));
 
     let vectors = FixedSizeListArray::try_new(
@@ -73,6 +75,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         PrimitiveArray::from_iter((0..opt.rows).map(|_| rng().random_range(0.0..1.0)));
 
     let records = StructArray::from_fields(&[
+        ("index", indices.into_array()),
         ("id", ids.into_array()),
         ("vector", vectors.into_array()),
         ("projection", projections.into_array()),
@@ -91,7 +94,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let stream = file
         .scan()?
         .with_filter(lt(col("rand_float"), lit(0.1)))
-        .with_projection(select(["id", "projection"], root()))
+        .with_projection(select(["index", "id", "projection"], root()))
         .into_array_stream()?;
 
     let mut stream = Box::pin(stream);
@@ -102,14 +105,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     while let Some(array) = stream.next().await {
         let array = array?;
-
         let s = array.to_struct();
+        let indices = s.field_by_name("index")?.to_primitive();
         let ids = s.field_by_name("id")?.to_varbinview();
         let projections = s.field_by_name("projection")?.to_fixed_size_list();
 
-        let len = ids.len();
+        for i in 0..s.len() {
+            let index = indices.scalar_at(i);
+            let index = index.as_primitive().typed_value().unwrap();
 
-        for i in 0..len {
             let id = ids.scalar_at(i);
             let id = id.as_utf8().value().unwrap();
             let id = id.as_str();
@@ -128,6 +132,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             if heap.len() < opt.top_k {
                 heap.push(HeapElement {
+                    index,
                     id: id.to_string(),
                     distance,
                 });
@@ -136,6 +141,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if distance < min.distance {
                         heap.pop();
                         heap.push(HeapElement {
+                            index,
                             id: id.to_string(),
                             distance,
                         });
@@ -145,11 +151,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let top_k = heap
-        .into_sorted_vec()
-        .into_iter()
+    let top_k = heap.into_sorted_vec();
+
+    let id_to_distance = top_k
+        .iter()
         .map(|h| (h.id.clone(), h.distance))
         .collect::<HashMap<_, _>>();
+
+    let mut indices = top_k.iter().map(|h| h.index).collect::<Vec<_>>();
+    indices.sort();
+    let selection = Selection::IncludeByIndex(Buffer::from_iter(indices));
 
     let mut projection_mask = vec!["id"];
     if opt.include_values {
@@ -159,24 +170,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         projection_mask.push("rand_float");
     }
 
-    let filter = if top_k.is_empty() {
-        lit(false)
-    } else {
-        let scalars = top_k
-            .keys()
-            .map(|id| Scalar::from(id.as_str()))
-            .collect::<Vec<_>>();
-        let list = Scalar::list(
-            scalars.first().unwrap().dtype().clone(),
-            scalars,
-            Nullability::NonNullable,
-        );
-        list_contains(lit(list), col("id"))
-    };
-
     let results = file
         .scan()?
-        .with_filter(filter)
+        .with_selection(selection)
         .with_projection(select(projection_mask.as_slice(), root()))
         .into_array_stream()?
         .read_all()
@@ -193,7 +189,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let id = id_utf8_value.as_str();
         result_string.push_str(&format!("id={}", id));
 
-        let distance = top_k.get(id).unwrap();
+        let distance = id_to_distance.get(id).unwrap();
         result_string.push_str(&format!(" distance={}", distance));
 
         if opt.include_values {
@@ -221,6 +217,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[derive(Debug, PartialEq, Eq, Ord)]
 struct HeapElement {
+    index: u64,
     id: String,
     distance: usize,
 }
