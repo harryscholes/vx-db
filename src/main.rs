@@ -12,6 +12,7 @@ use vortex::{
     ArraySession, IntoArray, ToCanonical,
     arrays::{BoolArray, FixedSizeListArray, PrimitiveArray, StructArray, VarBinViewArray},
     buffer::Buffer,
+    compressor::BtrBlocksCompressor,
     compute::{Operator, compare},
     expr::{col, lit, lt, root, select},
     file::{OpenOptionsSessionExt, WriteOptionsSessionExt},
@@ -50,7 +51,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     vortex::file::register_default_encodings(&session);
 
-    let indices = PrimitiveArray::from_iter(0..opt.rows as u64);
+    let row_idxs = PrimitiveArray::from_iter(0..opt.rows as u64);
+    let compressor = BtrBlocksCompressor::default();
+    let row_idxs = compressor.compress(row_idxs.as_ref())?;
 
     let ids = VarBinViewArray::from_iter_str((0..opt.rows).map(|_| Uuid::new_v4().to_string()));
 
@@ -76,7 +79,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         PrimitiveArray::from_iter((0..opt.rows).map(|_| rng().random_range(0.0..1.0)));
 
     let records = StructArray::from_fields(&[
-        ("index", indices.into_array()),
+        ("row_idx", row_idxs.into_array()),
         ("id", ids.into_array()),
         ("vector", vectors.into_array()),
         ("projection", projections.into_array()),
@@ -95,7 +98,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let stream = file
         .scan()?
         .with_filter(lt(col("rand_float"), lit(0.1)))
-        .with_projection(select(["index", "id", "projection"], root()))
+        .with_projection(select(["row_idx", "id", "projection"], root()))
         .into_array_stream()?;
 
     let mut stream = Box::pin(stream);
@@ -107,13 +110,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     while let Some(array) = stream.next().await {
         let array = array?;
         let s = array.to_struct();
-        let indices = s.field_by_name("index")?.to_primitive();
+        let row_idxs = s.field_by_name("row_idx")?.to_primitive();
         let ids = s.field_by_name("id")?.to_varbinview();
         let projections = s.field_by_name("projection")?.to_fixed_size_list();
 
         for i in 0..s.len() {
-            let index = indices.scalar_at(i);
-            let index = index.as_primitive().typed_value().unwrap();
+            let row_idx = row_idxs.scalar_at(i);
+            let row_idx = row_idx.as_primitive().typed_value().unwrap();
 
             let id = ids.scalar_at(i);
             let id = id.as_utf8().value().unwrap();
@@ -133,7 +136,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             if heap.len() < opt.top_k {
                 heap.push(HeapElement {
-                    index,
+                    row_idx,
                     id: id.to_string(),
                     distance,
                 });
@@ -142,7 +145,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if distance < min.distance {
                         heap.pop();
                         heap.push(HeapElement {
-                            index,
+                            row_idx,
                             id: id.to_string(),
                             distance,
                         });
@@ -159,9 +162,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|h| (h.id.clone(), h.distance))
         .collect::<HashMap<_, _>>();
 
-    let mut indices = top_k.iter().map(|h| h.index).collect::<Vec<_>>();
-    indices.sort();
-    let selection = Selection::IncludeByIndex(Buffer::from_iter(indices));
+    let mut row_idxs = top_k.iter().map(|h| h.row_idx).collect::<Vec<_>>();
+    row_idxs.sort();
+    let selection = Selection::IncludeByIndex(Buffer::from_iter(row_idxs));
 
     let mut projection_mask = vec!["id"];
     if opt.include_values {
@@ -226,7 +229,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[derive(Debug, PartialEq, Eq, Ord)]
 struct HeapElement {
-    index: u64,
+    row_idx: u64,
     id: String,
     distance: usize,
 }
