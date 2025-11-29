@@ -24,7 +24,7 @@ use vortex::{
     dtype::{DType, Nullability, StructFields},
     encodings::sequence::SequenceArray,
     error::VortexResult,
-    expr::{and, col, eq, lit, lt, root, select},
+    expr::{and_collect, col, eq, lit, lt, root, select},
     file::{OpenOptionsSessionExt, WriteOptionsSessionExt},
     io::session::RuntimeSession,
     layout::session::LayoutSession,
@@ -125,7 +125,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let ivf_partition_idxs = compressor.compress(ivf_partition_idxs.as_ref())?;
 
         let rand_floats =
-            PrimitiveArray::from_iter((0..chunk_size).map(|_| rng().random_range(0.0..1.0)));
+            PrimitiveArray::from_iter((0..chunk_size).map(|_| rng().random_range(0.0f64..1.0)));
+
+        let rand_categorical =
+            PrimitiveArray::from_iter((0..chunk_size).map(|_| rng().random_range(0u32..10)));
+        let compressor = BtrBlocksCompressor::default();
+        let rand_categorical = compressor.compress(rand_categorical.as_ref())?;
 
         let struct_array = StructArray::from_fields(&[
             ("row_idx", row_idxs.into_array()),
@@ -134,6 +139,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ("projection", projections.into_array()),
             ("ivf_partition_idx", ivf_partition_idxs.into_array()),
             ("rand_float", rand_floats.into_array()),
+            ("rand_categorical", rand_categorical.into_array()),
         ])?;
 
         if let Some(pbar) = &pbar {
@@ -156,6 +162,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "projection",
                 "ivf_partition_idx",
                 "rand_float",
+                "rand_categorical",
             ]
             .into(),
             vec![
@@ -176,6 +183,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ),
                 DType::Primitive(vortex::dtype::PType::U32, Nullability::NonNullable),
                 DType::Primitive(vortex::dtype::PType::F64, Nullability::NonNullable),
+                DType::Primitive(vortex::dtype::PType::U32, Nullability::NonNullable),
             ],
         ),
         Nullability::NonNullable,
@@ -207,16 +215,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let query_projection = BoolArray::from_iter((0..opt.dimension).map(|_| rng().random_bool(0.5)));
     let max_ivf_partition_idx = rows / ivf_partition_size;
     let query_ivf_partition_idx = rng().random_range(0..max_ivf_partition_idx);
+    let query_rand_categorical = rng().random_range(0u32..10);
 
     let stream = file
         .scan()?
-        .with_filter(and(
-            eq(
-                col("ivf_partition_idx"),
-                lit(query_ivf_partition_idx as u32),
-            ),
-            lt(col("rand_float"), lit(0.1)),
-        ))
+        .with_filter(
+            and_collect(vec![
+                eq(
+                    col("ivf_partition_idx"),
+                    lit(query_ivf_partition_idx as u32),
+                ),
+                eq(col("rand_categorical"), lit(query_rand_categorical)),
+                lt(col("rand_float"), lit(0.1)),
+            ])
+            .unwrap(),
+        )
         .with_projection(select(["row_idx", "id", "projection"], root()))
         .into_array_stream()?;
 
