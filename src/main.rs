@@ -2,18 +2,26 @@ use std::{
     cmp::Ordering,
     collections::{BinaryHeap, HashMap},
     fmt::Display,
+    path::PathBuf,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
 };
 
 use clap::Parser;
-use futures_util::StreamExt;
+use futures_util::{Stream, StreamExt, stream};
 use rand::{Rng, rng};
+use tokio::sync::Mutex;
+use tqdm::pbar;
 use uuid::Uuid;
 use vortex::{
-    ArraySession, IntoArray, ToCanonical,
+    ArrayRef, ArraySession, IntoArray, ToCanonical,
     arrays::{BoolArray, FixedSizeListArray, PrimitiveArray, StructArray, VarBinViewArray},
     buffer::Buffer,
     compressor::BtrBlocksCompressor,
     compute::{Operator, compare},
+    dtype::{DType, Nullability, StructFields},
+    error::VortexResult,
     expr::{col, lit, lt, root, select},
     file::{OpenOptionsSessionExt, WriteOptionsSessionExt},
     io::session::RuntimeSession,
@@ -21,27 +29,44 @@ use vortex::{
     metrics::VortexMetrics,
     scan::Selection,
     session::VortexSession,
-    stream::ArrayStreamExt,
+    stream::{ArrayStream, ArrayStreamExt},
     validity::Validity,
 };
 
 #[derive(Debug, Parser)]
 struct Opt {
-    #[arg(long, short = 'n', default_value_t = 1_000)]
+    #[arg(long, short = 'f', default_value = "db.vortex")]
+    path: PathBuf,
+    #[arg(long, short = 'n', default_value_t = 1024)]
     rows: usize,
     #[arg(long, short = 'd', default_value_t = 512)]
     dimension: usize,
     #[arg(long, short = 'k', default_value_t = 10)]
     top_k: usize,
+    #[arg(long, short = 'c', default_value_t = 1024)]
+    chunk_size: usize,
     #[arg(long)]
     include_values: bool,
     #[arg(long)]
     include_metadata: bool,
+    #[arg(long)]
+    progress: bool,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let opt = Opt::parse();
+
+    let Opt {
+        path,
+        rows,
+        chunk_size,
+        dimension,
+        top_k,
+        include_values,
+        include_metadata,
+        progress,
+    } = opt;
 
     let session = VortexSession::empty()
         .with::<ArraySession>()
@@ -51,49 +76,104 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     vortex::file::register_default_encodings(&session);
 
-    let row_idxs = PrimitiveArray::from_iter(0..opt.rows as u64);
-    let compressor = BtrBlocksCompressor::default();
-    let row_idxs = compressor.compress(row_idxs.as_ref())?;
+    println!("writing vortex file to {path:?}");
 
-    let ids = VarBinViewArray::from_iter_str((0..opt.rows).map(|_| Uuid::new_v4().to_string()));
+    let pbar = progress.then(|| Arc::new(Mutex::new(pbar(Some(rows)))));
 
-    let vectors = FixedSizeListArray::try_new(
-        PrimitiveArray::from_iter(
-            (0..opt.rows * opt.dimension).map(|_| rng().random_range(-1.0..1.0)),
-        )
-        .into_array(),
-        opt.dimension as u32,
-        Validity::NonNullable,
-        opt.rows,
-    )?;
+    let chunk_stream = stream::try_unfold((0usize, pbar), move |(written, pbar)| async move {
+        if written >= rows {
+            return Ok(None);
+        }
 
-    let projections = FixedSizeListArray::try_new(
-        BoolArray::from_iter((0..opt.rows * opt.dimension).map(|_| rng().random_bool(0.5)))
+        let chunk_size = chunk_size.min(rows - written);
+
+        let row_idxs = PrimitiveArray::from_iter(written as u64..(written + chunk_size) as u64);
+        let compressor = BtrBlocksCompressor::default();
+        let row_idxs = compressor.compress(row_idxs.as_ref())?;
+
+        let ids =
+            VarBinViewArray::from_iter_str((0..chunk_size).map(|_| Uuid::new_v4().to_string()));
+
+        let vectors = FixedSizeListArray::try_new(
+            PrimitiveArray::from_iter(
+                (0..chunk_size * dimension).map(|_| rng().random_range(-1.0..1.0)),
+            )
             .into_array(),
-        opt.dimension as u32,
-        Validity::NonNullable,
-        opt.rows,
-    )?;
+            dimension as u32,
+            Validity::NonNullable,
+            chunk_size,
+        )?;
 
-    let rand_floats =
-        PrimitiveArray::from_iter((0..opt.rows).map(|_| rng().random_range(0.0..1.0)));
+        let projections = FixedSizeListArray::try_new(
+            BoolArray::from_iter((0..chunk_size * dimension).map(|_| rng().random_bool(0.5)))
+                .into_array(),
+            dimension as u32,
+            Validity::NonNullable,
+            chunk_size,
+        )?;
 
-    let records = StructArray::from_fields(&[
-        ("row_idx", row_idxs.into_array()),
-        ("id", ids.into_array()),
-        ("vector", vectors.into_array()),
-        ("projection", projections.into_array()),
-        ("rand_float", rand_floats.into_array()),
-    ])?;
+        let rand_floats =
+            PrimitiveArray::from_iter((0..chunk_size).map(|_| rng().random_range(0.0..1.0)));
 
-    let mut file = tokio::fs::File::create("test.vortex").await?;
+        let struct_array = StructArray::from_fields(&[
+            ("row_idx", row_idxs.into_array()),
+            ("id", ids.into_array()),
+            ("vector", vectors.into_array()),
+            ("projection", projections.into_array()),
+            ("rand_float", rand_floats.into_array()),
+        ])?;
+
+        if let Some(pbar) = &pbar {
+            _ = pbar.lock().await.update(chunk_size);
+        }
+
+        Ok(Some((
+            struct_array.into_array(),
+            (written + chunk_size, pbar),
+        )))
+    })
+    .boxed();
+
+    let dtype = DType::Struct(
+        StructFields::new(
+            ["row_idx", "id", "vector", "projection", "rand_float"].into(),
+            vec![
+                DType::Primitive(vortex::dtype::PType::U64, Nullability::NonNullable),
+                DType::Utf8(Nullability::NonNullable),
+                DType::FixedSizeList(
+                    Arc::new(DType::Primitive(
+                        vortex::dtype::PType::F64,
+                        Nullability::NonNullable,
+                    )),
+                    dimension as u32,
+                    Nullability::NonNullable,
+                ),
+                DType::FixedSizeList(
+                    Arc::new(DType::Bool(Nullability::NonNullable)),
+                    dimension as u32,
+                    Nullability::NonNullable,
+                ),
+                DType::Primitive(vortex::dtype::PType::F64, Nullability::NonNullable),
+            ],
+        ),
+        Nullability::NonNullable,
+    );
+
+    let array_stream = StreamArrayStream {
+        inner: chunk_stream,
+        dtype,
+    };
+
+    let mut file = tokio::fs::File::create(&path).await?;
 
     session
         .write_options()
-        .write(&mut file, records.to_array_stream())
+        .write(&mut file, array_stream)
         .await?;
 
-    let file = session.open_options().open("test.vortex").await?;
+    println!("reading vortex file from {path:?}");
+
+    let file = session.open_options().open(path).await?;
 
     let stream = file
         .scan()?
@@ -109,6 +189,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     while let Some(array) = stream.next().await {
         let array = array?;
+
         let s = array.to_struct();
         let row_idxs = s.field_by_name("row_idx")?.to_primitive();
         let ids = s.field_by_name("id")?.to_varbinview();
@@ -134,7 +215,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .as_bool_typed()
             .true_count()?;
 
-            if heap.len() < opt.top_k {
+            if heap.len() < top_k {
                 heap.push(HeapElement {
                     row_idx,
                     id: id.to_string(),
@@ -167,10 +248,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let selection = Selection::IncludeByIndex(Buffer::from_iter(row_idxs));
 
     let mut projection_mask = vec!["id"];
-    if opt.include_values {
+    if include_values {
         projection_mask.push("vector");
     }
-    if opt.include_metadata {
+    if include_metadata {
         projection_mask.push("rand_float");
     }
 
@@ -195,12 +276,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let distance = *id_to_distance.get(&id).unwrap();
 
-            let vector = opt.include_values.then(|| {
+            let vector = include_values.then(|| {
                 let vectors = vectors.as_ref().unwrap().to_fixed_size_list();
                 vectors.fixed_size_list_elements_at(i).to_primitive()
             });
 
-            let metadata = opt.include_metadata.then(|| {
+            let metadata = include_metadata.then(|| {
                 let rand_floats = rand_floats.as_ref().unwrap().to_primitive();
                 rand_floats
                     .scalar_at(i)
@@ -225,6 +306,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+struct StreamArrayStream {
+    dtype: DType,
+    inner: Pin<Box<dyn Stream<Item = VortexResult<ArrayRef>> + Send>>,
+}
+
+impl Stream for StreamArrayStream {
+    type Item = VortexResult<ArrayRef>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.inner.as_mut().poll_next(cx)
+    }
+}
+
+impl ArrayStream for StreamArrayStream {
+    fn dtype(&self) -> &DType {
+        &self.dtype
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, Ord)]
