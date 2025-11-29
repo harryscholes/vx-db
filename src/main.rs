@@ -35,6 +35,14 @@ use vortex::{
     validity::Validity,
 };
 
+const ROW_IDX_COL: &str = "row_idx";
+const ID_COL: &str = "id";
+const VECTOR_COL: &str = "vector";
+const PROJECTION_COL: &str = "projection";
+const IVF_PARTITION_IDX_COL: &str = "ivf_partition_idx";
+const RAND_FLOAT_COL: &str = "rand_float";
+const RAND_CATEGORICAL_COL: &str = "rand_categorical";
+
 #[derive(Debug, Parser)]
 struct Opt {
     #[arg(long, short = 'f', default_value = "db.vortex")]
@@ -53,6 +61,12 @@ struct Opt {
     include_metadata: bool,
     #[arg(long)]
     progress: bool,
+    #[arg(long, default_value_t = 10)]
+    rand_categorical_cardinality: u32,
+    #[arg(long)]
+    rand_categorical: Option<u32>,
+    #[arg(long, default_value_t = 0.1)]
+    rand_float_selectivity: f64,
 }
 
 #[tokio::main]
@@ -68,6 +82,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         include_values,
         include_metadata,
         progress,
+        rand_categorical_cardinality,
+        rand_categorical,
+        rand_float_selectivity,
     } = opt;
 
     let session = VortexSession::empty()
@@ -127,19 +144,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let rand_floats =
             PrimitiveArray::from_iter((0..chunk_size).map(|_| rng().random_range(0.0f64..1.0)));
 
-        let rand_categorical =
-            PrimitiveArray::from_iter((0..chunk_size).map(|_| rng().random_range(0u32..10)));
+        let rand_categorical = PrimitiveArray::from_iter(
+            (0..chunk_size).map(|_| rng().random_range(0u32..rand_categorical_cardinality)),
+        );
         let compressor = BtrBlocksCompressor::default();
         let rand_categorical = compressor.compress(rand_categorical.as_ref())?;
 
         let struct_array = StructArray::from_fields(&[
-            ("row_idx", row_idxs.into_array()),
-            ("id", ids.into_array()),
-            ("vector", vectors.into_array()),
-            ("projection", projections.into_array()),
-            ("ivf_partition_idx", ivf_partition_idxs.into_array()),
-            ("rand_float", rand_floats.into_array()),
-            ("rand_categorical", rand_categorical.into_array()),
+            (ROW_IDX_COL, row_idxs.into_array()),
+            (ID_COL, ids.into_array()),
+            (VECTOR_COL, vectors.into_array()),
+            (PROJECTION_COL, projections.into_array()),
+            (IVF_PARTITION_IDX_COL, ivf_partition_idxs.into_array()),
+            (RAND_FLOAT_COL, rand_floats.into_array()),
+            (RAND_CATEGORICAL_COL, rand_categorical.into_array()),
         ])?;
 
         if let Some(pbar) = &pbar {
@@ -156,13 +174,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dtype = DType::Struct(
         StructFields::new(
             [
-                "row_idx",
-                "id",
-                "vector",
-                "projection",
-                "ivf_partition_idx",
-                "rand_float",
-                "rand_categorical",
+                ROW_IDX_COL,
+                ID_COL,
+                VECTOR_COL,
+                PROJECTION_COL,
+                IVF_PARTITION_IDX_COL,
+                RAND_FLOAT_COL,
+                RAND_CATEGORICAL_COL,
             ]
             .into(),
             vec![
@@ -215,22 +233,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let query_projection = BoolArray::from_iter((0..opt.dimension).map(|_| rng().random_bool(0.5)));
     let max_ivf_partition_idx = rows / ivf_partition_size;
     let query_ivf_partition_idx = rng().random_range(0..max_ivf_partition_idx);
-    let query_rand_categorical = rng().random_range(0u32..10);
+    let query_rand_categorical =
+        rand_categorical.unwrap_or_else(|| rng().random_range(0u32..rand_categorical_cardinality));
 
     let stream = file
         .scan()?
         .with_filter(
             and_collect(vec![
                 eq(
-                    col("ivf_partition_idx"),
+                    col(IVF_PARTITION_IDX_COL),
                     lit(query_ivf_partition_idx as u32),
                 ),
-                eq(col("rand_categorical"), lit(query_rand_categorical)),
-                lt(col("rand_float"), lit(0.1)),
+                eq(col(RAND_CATEGORICAL_COL), lit(query_rand_categorical)),
+                lt(col(RAND_FLOAT_COL), lit(rand_float_selectivity)),
             ])
             .unwrap(),
         )
-        .with_projection(select(["row_idx", "id", "projection"], root()))
+        .with_projection(select([ROW_IDX_COL, ID_COL, PROJECTION_COL], root()))
         .into_array_stream()?;
 
     let mut stream = Box::pin(stream);
@@ -241,9 +260,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let array = array?;
 
         let s = array.to_struct();
-        let row_idxs = s.field_by_name("row_idx")?.to_primitive();
-        let ids = s.field_by_name("id")?.to_varbinview();
-        let projections = s.field_by_name("projection")?.to_fixed_size_list();
+        let row_idxs = s.field_by_name(ROW_IDX_COL)?.to_primitive();
+        let ids = s.field_by_name(ID_COL)?.to_varbinview();
+        let projections = s.field_by_name(PROJECTION_COL)?.to_fixed_size_list();
 
         for i in 0..s.len() {
             let row_idx = row_idxs.scalar_at(i);
@@ -297,12 +316,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     row_idxs.sort();
     let selection = Selection::IncludeByIndex(Buffer::from_iter(row_idxs));
 
-    let mut projection_mask = vec!["id"];
+    let mut projection_mask = vec![ID_COL];
     if include_values {
-        projection_mask.push("vector");
+        projection_mask.push(VECTOR_COL);
     }
     if include_metadata {
-        projection_mask.push("rand_float");
+        projection_mask.push(RAND_FLOAT_COL);
+        projection_mask.push(RAND_CATEGORICAL_COL);
     }
 
     let results = file
@@ -314,9 +334,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     let s = results.to_struct();
-    let ids = s.field_by_name("id")?.to_varbinview();
-    let vectors = s.field_by_name("vector");
-    let rand_floats = s.field_by_name("rand_float");
+    let ids = s.field_by_name(ID_COL)?.to_varbinview();
+    let vectors = s.field_by_name(VECTOR_COL);
+    let rand_floats = s.field_by_name(RAND_FLOAT_COL);
+    let rand_categorical = s.field_by_name(RAND_CATEGORICAL_COL);
 
     let mut results = (0..s.len())
         .map(|i| {
@@ -333,11 +354,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let metadata = include_metadata.then(|| {
                 let rand_floats = rand_floats.as_ref().unwrap().to_primitive();
-                rand_floats
+                let rand_float = rand_floats
                     .scalar_at(i)
                     .as_primitive()
                     .typed_value()
-                    .unwrap()
+                    .unwrap();
+                let rand_categorical = rand_categorical.as_ref().unwrap().to_primitive();
+                let rand_categorical = rand_categorical
+                    .scalar_at(i)
+                    .as_primitive()
+                    .typed_value()
+                    .unwrap();
+                (rand_float, rand_categorical)
             });
 
             ResultElement {
@@ -396,7 +424,7 @@ struct ResultElement {
     id: String,
     distance: usize,
     vector: Option<PrimitiveArray>,
-    metadata: Option<f64>,
+    metadata: Option<(f64, u32)>,
 }
 
 impl Display for ResultElement {
@@ -406,7 +434,7 @@ impl Display for ResultElement {
             write!(f, " values={}", vector.display_values())?;
         }
         if let Some(metadata) = self.metadata {
-            write!(f, " metadata={}", metadata)?;
+            write!(f, " metadata=({}, {})", metadata.0, metadata.1)?;
         }
         Ok(())
     }
