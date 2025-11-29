@@ -6,6 +6,7 @@ use std::{
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
+    time::Instant,
 };
 
 use clap::Parser;
@@ -21,8 +22,9 @@ use vortex::{
     compressor::BtrBlocksCompressor,
     compute::{Operator, compare},
     dtype::{DType, Nullability, StructFields},
+    encodings::sequence::SequenceArray,
     error::VortexResult,
-    expr::{col, lit, lt, root, select},
+    expr::{and, col, eq, lit, lt, root, select},
     file::{OpenOptionsSessionExt, WriteOptionsSessionExt},
     io::session::RuntimeSession,
     layout::session::LayoutSession,
@@ -77,19 +79,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     vortex::file::register_default_encodings(&session);
 
     println!("writing vortex file to {path:?}");
+    let write_stage_start = Instant::now();
+
+    let ivf_partitions = rows.isqrt();
+    let ivf_partition_size = (rows + ivf_partitions - 1) / ivf_partitions;
 
     let pbar = progress.then(|| Arc::new(Mutex::new(pbar(Some(rows)))));
 
-    let chunk_stream = stream::try_unfold((0usize, pbar), move |(written, pbar)| async move {
-        if written >= rows {
+    let chunk_stream = stream::try_unfold((0usize, pbar), move |(rows_written, pbar)| async move {
+        if rows_written >= rows {
             return Ok(None);
         }
 
-        let chunk_size = chunk_size.min(rows - written);
+        let chunk_size = chunk_size.min(rows - rows_written);
 
-        let row_idxs = PrimitiveArray::from_iter(written as u64..(written + chunk_size) as u64);
-        let compressor = BtrBlocksCompressor::default();
-        let row_idxs = compressor.compress(row_idxs.as_ref())?;
+        let row_idxs =
+            SequenceArray::typed_new(rows_written as u64, 1, Nullability::NonNullable, chunk_size)?
+                .into_array();
 
         let ids =
             VarBinViewArray::from_iter_str((0..chunk_size).map(|_| Uuid::new_v4().to_string()));
@@ -112,6 +118,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             chunk_size,
         )?;
 
+        let ivf_partition_idxs = PrimitiveArray::from_iter(
+            (0..chunk_size).map(|i| ((rows_written + i) / ivf_partition_size) as u32),
+        );
+        let compressor = BtrBlocksCompressor::default();
+        let ivf_partition_idxs = compressor.compress(ivf_partition_idxs.as_ref())?;
+
         let rand_floats =
             PrimitiveArray::from_iter((0..chunk_size).map(|_| rng().random_range(0.0..1.0)));
 
@@ -120,6 +132,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ("id", ids.into_array()),
             ("vector", vectors.into_array()),
             ("projection", projections.into_array()),
+            ("ivf_partition_idx", ivf_partition_idxs.into_array()),
             ("rand_float", rand_floats.into_array()),
         ])?;
 
@@ -129,14 +142,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         Ok(Some((
             struct_array.into_array(),
-            (written + chunk_size, pbar),
+            (rows_written + chunk_size, pbar),
         )))
     })
     .boxed();
 
     let dtype = DType::Struct(
         StructFields::new(
-            ["row_idx", "id", "vector", "projection", "rand_float"].into(),
+            [
+                "row_idx",
+                "id",
+                "vector",
+                "projection",
+                "ivf_partition_idx",
+                "rand_float",
+            ]
+            .into(),
             vec![
                 DType::Primitive(vortex::dtype::PType::U64, Nullability::NonNullable),
                 DType::Utf8(Nullability::NonNullable),
@@ -153,6 +174,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     dimension as u32,
                     Nullability::NonNullable,
                 ),
+                DType::Primitive(vortex::dtype::PType::U32, Nullability::NonNullable),
                 DType::Primitive(vortex::dtype::PType::F64, Nullability::NonNullable),
             ],
         ),
@@ -171,19 +193,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .write(&mut file, array_stream)
         .await?;
 
+    println!(
+        "write stage elapsed time: {:?}",
+        write_stage_start.elapsed()
+    );
+
     println!("reading vortex file from {path:?}");
+    let read_stage_start = Instant::now();
 
     let file = session.open_options().open(path).await?;
 
+    // Mock query
+    let query_projection = BoolArray::from_iter((0..opt.dimension).map(|_| rng().random_bool(0.5)));
+    let max_ivf_partition_idx = rows / ivf_partition_size;
+    let query_ivf_partition_idx = rng().random_range(0..max_ivf_partition_idx);
+
     let stream = file
         .scan()?
-        .with_filter(lt(col("rand_float"), lit(0.1)))
+        .with_filter(and(
+            eq(
+                col("ivf_partition_idx"),
+                lit(query_ivf_partition_idx as u32),
+            ),
+            lt(col("rand_float"), lit(0.1)),
+        ))
         .with_projection(select(["row_idx", "id", "projection"], root()))
         .into_array_stream()?;
 
     let mut stream = Box::pin(stream);
-
-    let query_projection = BoolArray::from_iter((0..opt.dimension).map(|_| rng().random_bool(0.5)));
 
     let mut heap = BinaryHeap::<HeapElement>::new();
 
@@ -304,6 +341,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for result in results {
         println!("{}", result);
     }
+
+    println!("read stage elapsed time: {:?}", read_stage_start.elapsed());
 
     Ok(())
 }
