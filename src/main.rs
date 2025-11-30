@@ -28,7 +28,7 @@ use vortex::{
     file::{OpenOptionsSessionExt, WriteOptionsSessionExt},
     io::session::RuntimeSession,
     layout::session::LayoutSession,
-    metrics::VortexMetrics,
+    metrics::{Metric, VortexMetrics},
     scan::Selection,
     session::VortexSession,
     stream::{ArrayStream, ArrayStreamExt},
@@ -227,7 +227,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("reading vortex file from {path:?}");
     let read_stage_start = Instant::now();
 
-    let file = session.open_options().open(path).await?;
+    let file = session.open_options().open(path).await.unwrap();
+
+    let metrics = file.metrics();
 
     // Mock query
     let query_projection = BoolArray::from_iter((0..opt.dimension).map(|_| rng().random_bool(0.5)));
@@ -384,6 +386,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!("read stage elapsed time: {:?}", read_stage_start.elapsed());
+
+    let snapshot = metrics.snapshot();
+
+    for (id, metric) in snapshot.iter() {
+        let name = id.name();
+
+        match metric {
+            Metric::Counter(counter) => {
+                let value = counter.count();
+                println!("counter {name}: {value}");
+            }
+            Metric::Histogram(hist) => {
+                // e.g. bytes per read or similar, if defined that way
+                let snapshot = hist.snapshot();
+                let p50 = snapshot.value(0.5);
+                let p99 = snapshot.value(0.99);
+                println!("histogram {name}: p50={p50}, p99={p99}");
+            }
+            Metric::Timer(timer) => {
+                let snapshot = timer.snapshot();
+                let p50 = snapshot.value(0.5);
+                let p99 = snapshot.value(0.99);
+                println!("timer {name}: p50={p50}, p99={p99}");
+            }
+            _ => {}
+        }
+    }
 
     Ok(())
 }
