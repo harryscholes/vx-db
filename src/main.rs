@@ -214,7 +214,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut file = tokio::fs::File::create(&path).await?;
 
-    session
+    let write_summary = session
         .write_options()
         .write(&mut file, array_stream)
         .await?;
@@ -223,6 +223,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "write stage elapsed time: {:?}",
         write_stage_start.elapsed()
     );
+
+    let file_size = write_summary.size();
+    println!("file size: {:.2} MB", file_size as f64 / (1 << 20) as f64);
 
     println!("reading vortex file from {path:?}");
     let read_stage_start = Instant::now();
@@ -398,7 +401,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("counter {name}: {value}");
             }
             Metric::Histogram(hist) => {
-                // e.g. bytes per read or similar, if defined that way
                 let snapshot = hist.snapshot();
                 let p50 = snapshot.value(0.5);
                 let p99 = snapshot.value(0.99);
