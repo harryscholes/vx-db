@@ -124,7 +124,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let vectors = FixedSizeListArray::try_new(
             PrimitiveArray::from_iter(
-                (0..chunk_size * dimension).map(|_| rng().random_range(-1.0..1.0)),
+                (0..chunk_size * dimension).map(|_| rng().random_range(-1.0f32..1.0)),
             )
             .into_array(),
             dimension as u32,
@@ -201,7 +201,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 DType::Utf8(Nullability::NonNullable),
                 DType::FixedSizeList(
                     Arc::new(DType::Primitive(
-                        vortex::dtype::PType::F64,
+                        vortex::dtype::PType::F32,
                         Nullability::NonNullable,
                     )),
                     dimension as u32,
@@ -290,13 +290,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let projections = s.field_by_name(PROJECTION_COL)?.to_fixed_size_list();
 
             for i in 0..s.len() {
-                let row_idx = row_idxs.scalar_at(i);
-                let row_idx = row_idx.as_primitive().typed_value().unwrap();
-
-                let id = ids.scalar_at(i);
-                let id = id.as_utf8().value().unwrap();
-                let id = id.as_str();
-
                 let projection_array = projections.fixed_size_list_elements_at(i);
                 let projection = projection_array.to_bool();
 
@@ -310,22 +303,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .true_count()?;
 
                 if heap.len() < top_k {
+                    let row_idx = row_idxs.scalar_at(i);
+                    let row_idx = row_idx.as_primitive().typed_value().unwrap();
+
+                    let id = ids.scalar_at(i);
+                    let id = id.as_utf8().value().unwrap();
+                    let id = id.as_str();
+
                     heap.push(HeapElement {
                         row_idx,
                         id: id.to_string(),
                         distance,
                     });
-                } else {
-                    if let Some(min) = heap.peek() {
-                        if distance < min.distance {
-                            heap.pop();
-                            heap.push(HeapElement {
-                                row_idx,
-                                id: id.to_string(),
-                                distance,
-                            });
-                        }
-                    }
+                } else if let Some(min) = heap.peek()
+                    && distance < min.distance
+                {
+                    let row_idx = row_idxs.scalar_at(i);
+                    let row_idx = row_idx.as_primitive().typed_value().unwrap();
+
+                    let id = ids.scalar_at(i);
+                    let id = id.as_utf8().value().unwrap();
+                    let id = id.as_str();
+
+                    heap.pop();
+                    heap.push(HeapElement {
+                        row_idx,
+                        id: id.to_string(),
+                        distance,
+                    });
                 }
             }
         }
