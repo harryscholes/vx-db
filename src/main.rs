@@ -41,7 +41,8 @@ const VECTOR_COL: &str = "vector";
 const PROJECTION_COL: &str = "projection";
 const IVF_PARTITION_IDX_COL: &str = "ivf_partition_idx";
 const RAND_FLOAT_COL: &str = "rand_float";
-const RAND_CATEGORICAL_COL: &str = "rand_categorical";
+const RAND_CATEGORICAL_1_COL: &str = "rand_categorical_1";
+const RAND_CATEGORICAL_2_COL: &str = "rand_categorical_2";
 
 #[derive(Debug, Parser)]
 struct Opt {
@@ -49,7 +50,7 @@ struct Opt {
     path: PathBuf,
     #[arg(long, short = 'n', default_value_t = 1024)]
     rows: usize,
-    #[arg(long, short = 'd', default_value_t = 512)]
+    #[arg(long, short = 'd', default_value_t = 1024)]
     dimension: usize,
     #[arg(long, short = 'k', default_value_t = 10)]
     top_k: usize,
@@ -61,11 +62,11 @@ struct Opt {
     include_metadata: bool,
     #[arg(long)]
     progress: bool,
-    #[arg(long, default_value_t = 10)]
+    #[arg(long, default_value_t = 5)]
     rand_categorical_cardinality: u32,
     #[arg(long)]
     rand_categorical: Option<u32>,
-    #[arg(long, default_value_t = 0.1)]
+    #[arg(long, default_value_t = 0.5)]
     rand_float_selectivity: f64,
 }
 
@@ -144,11 +145,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let rand_floats =
             PrimitiveArray::from_iter((0..chunk_size).map(|_| rng().random_range(0.0f64..1.0)));
 
-        let rand_categorical = PrimitiveArray::from_iter(
+        let rand_categorical_1 = PrimitiveArray::from_iter(
             (0..chunk_size).map(|_| rng().random_range(0u32..rand_categorical_cardinality)),
         );
         let compressor = BtrBlocksCompressor::default();
-        let rand_categorical = compressor.compress(rand_categorical.as_ref())?;
+        let rand_categorical_1 = compressor.compress(rand_categorical_1.as_ref())?;
+
+        let rand_categorical_2 = PrimitiveArray::from_iter(
+            (0..chunk_size).map(|_| rng().random_range(0u32..rand_categorical_cardinality)),
+        );
+        let compressor = BtrBlocksCompressor::default();
+        let rand_categorical_2 = compressor.compress(rand_categorical_2.as_ref())?;
 
         let struct_array = StructArray::from_fields(&[
             (ROW_IDX_COL, row_idxs.into_array()),
@@ -157,7 +164,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             (PROJECTION_COL, projections.into_array()),
             (IVF_PARTITION_IDX_COL, ivf_partition_idxs.into_array()),
             (RAND_FLOAT_COL, rand_floats.into_array()),
-            (RAND_CATEGORICAL_COL, rand_categorical.into_array()),
+            (RAND_CATEGORICAL_1_COL, rand_categorical_1.into_array()),
+            (RAND_CATEGORICAL_2_COL, rand_categorical_2.into_array()),
         ])?;
 
         if let Some(pbar) = &pbar {
@@ -180,7 +188,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 PROJECTION_COL,
                 IVF_PARTITION_IDX_COL,
                 RAND_FLOAT_COL,
-                RAND_CATEGORICAL_COL,
+                RAND_CATEGORICAL_1_COL,
+                RAND_CATEGORICAL_2_COL,
             ]
             .into(),
             vec![
@@ -201,6 +210,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ),
                 DType::Primitive(vortex::dtype::PType::U32, Nullability::NonNullable),
                 DType::Primitive(vortex::dtype::PType::F64, Nullability::NonNullable),
+                DType::Primitive(vortex::dtype::PType::U32, Nullability::NonNullable),
                 DType::Primitive(vortex::dtype::PType::U32, Nullability::NonNullable),
             ],
         ),
@@ -238,7 +248,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let query_projection = BoolArray::from_iter((0..opt.dimension).map(|_| rng().random_bool(0.5)));
     let max_ivf_partition_idx = rows / ivf_partition_size;
     let query_ivf_partition_idx = rng().random_range(0..max_ivf_partition_idx);
-    let query_rand_categorical =
+    let query_rand_categorical_1 =
+        rand_categorical.unwrap_or_else(|| rng().random_range(0u32..rand_categorical_cardinality));
+    let query_rand_categorical_2 =
         rand_categorical.unwrap_or_else(|| rng().random_range(0u32..rand_categorical_cardinality));
 
     let stream = file
@@ -249,7 +261,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     col(IVF_PARTITION_IDX_COL),
                     lit(query_ivf_partition_idx as u32),
                 ),
-                eq(col(RAND_CATEGORICAL_COL), lit(query_rand_categorical)),
+                eq(col(RAND_CATEGORICAL_1_COL), lit(query_rand_categorical_1)),
+                eq(col(RAND_CATEGORICAL_2_COL), lit(query_rand_categorical_2)),
                 lt(col(RAND_FLOAT_COL), lit(rand_float_selectivity)),
             ])
             .unwrap(),
@@ -327,7 +340,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if include_metadata {
         projection_mask.push(RAND_FLOAT_COL);
-        projection_mask.push(RAND_CATEGORICAL_COL);
+        projection_mask.push(RAND_CATEGORICAL_1_COL);
+        projection_mask.push(RAND_CATEGORICAL_2_COL);
     }
 
     let results = file
@@ -342,7 +356,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ids = s.field_by_name(ID_COL)?.to_varbinview();
     let vectors = s.field_by_name(VECTOR_COL);
     let rand_floats = s.field_by_name(RAND_FLOAT_COL);
-    let rand_categorical = s.field_by_name(RAND_CATEGORICAL_COL);
+    let rand_categorical_1 = s.field_by_name(RAND_CATEGORICAL_1_COL);
+    let rand_categorical_2 = s.field_by_name(RAND_CATEGORICAL_2_COL);
 
     let mut results = (0..s.len())
         .map(|i| {
@@ -364,13 +379,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .as_primitive()
                     .typed_value()
                     .unwrap();
-                let rand_categorical = rand_categorical.as_ref().unwrap().to_primitive();
-                let rand_categorical = rand_categorical
+                let rand_categorical_1 = rand_categorical_1.as_ref().unwrap().to_primitive();
+                let rand_categorical_1 = rand_categorical_1
                     .scalar_at(i)
                     .as_primitive()
                     .typed_value()
                     .unwrap();
-                (rand_float, rand_categorical)
+                let rand_categorical_2 = rand_categorical_2.as_ref().unwrap().to_primitive();
+                let rand_categorical_2 = rand_categorical_2
+                    .scalar_at(i)
+                    .as_primitive()
+                    .typed_value()
+                    .unwrap();
+                (rand_float, rand_categorical_1, rand_categorical_2)
             });
 
             ResultElement {
@@ -455,7 +476,7 @@ struct ResultElement {
     id: String,
     distance: usize,
     vector: Option<PrimitiveArray>,
-    metadata: Option<(f64, u32)>,
+    metadata: Option<(f64, u32, u32)>,
 }
 
 impl Display for ResultElement {
@@ -465,7 +486,11 @@ impl Display for ResultElement {
             write!(f, " values={}", vector.display_values())?;
         }
         if let Some(metadata) = self.metadata {
-            write!(f, " metadata=({}, {})", metadata.0, metadata.1)?;
+            write!(
+                f,
+                " metadata=({}, {}, {})",
+                metadata.0, metadata.1, metadata.2
+            )?;
         }
         Ok(())
     }
