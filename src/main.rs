@@ -108,7 +108,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let projection_bits = (projection_bits * dimension as f64) as usize;
 
     let ivf_partitions = rows.isqrt();
-    let ivf_partition_size = (rows + ivf_partitions - 1) / ivf_partitions;
+    let ivf_partition_size = rows.div_ceil(ivf_partitions);
 
     let pbar = progress.then(|| Arc::new(Mutex::new(tqdm::pbar(Some(rows)))));
 
@@ -536,7 +536,7 @@ impl ArrayStream for StreamArrayStream {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Ord)]
+#[derive(Debug, PartialEq, Eq)]
 struct HeapElement {
     row_idx: u64,
     id: String,
@@ -545,7 +545,13 @@ struct HeapElement {
 
 impl PartialOrd for HeapElement {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.distance.cmp(&other.distance))
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for HeapElement {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.distance.cmp(&other.distance)
     }
 }
 
