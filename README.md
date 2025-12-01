@@ -2,6 +2,8 @@
 
 A vector database on top of [Vortex](https://vortex.dev).
 
+This is a proof of concept and is not intended for production use.
+
 Features:
 - Random $D$-dimensional dense vectors
 - Random $B$-bit binary projections
