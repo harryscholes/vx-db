@@ -65,8 +65,8 @@ struct Opt {
     include_metadata: bool,
     #[arg(long)]
     progress: bool,
-    #[arg(long)]
-    rand_categorical_cardinality: Option<u32>,
+    #[arg(long, default_value_t = 5)]
+    rand_categorical_cardinality: u32,
     #[arg(long, default_value_t = 0.5)]
     rand_float_selectivity: f64,
     #[arg(long)]
@@ -105,9 +105,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let ivf_partitions = rows.isqrt();
     let ivf_partition_size = (rows + ivf_partitions - 1) / ivf_partitions;
-
-    let rand_categorical_cardinality =
-        rand_categorical_cardinality.unwrap_or_else(|| (rows.isqrt() as u32 / 10).max(3));
 
     let pbar = progress.then(|| Arc::new(Mutex::new(tqdm::pbar(Some(rows)))));
 
@@ -162,10 +159,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Validity::NonNullable,
                 chunk_size,
             )?;
-            // dbg!(vectors.nbytes());
-            // let compressor = BtrBlocksCompressor::default();
-            // let vectors = compressor.compress(vectors.as_ref())?;
-            // dbg!(vectors.nbytes());
 
             let projections = FixedSizeListArray::try_new(
                 BoolArray::from_iter((0..chunk_size * dimension).map(|_| rng().random_bool(0.5)))
@@ -178,8 +171,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let ivf_partition_idxs = PrimitiveArray::from_iter(
                 (0..chunk_size).map(|i| ((rows_written + i) / ivf_partition_size) as u32),
             );
-            // let compressor = BtrBlocksCompressor::default();
-            // let ivf_partition_idxs = compressor.compress(ivf_partition_idxs.as_ref())?;
 
             let rand_floats =
                 PrimitiveArray::from_iter((0..chunk_size).map(|_| rng().random_range(0.0f64..1.0)));
@@ -187,14 +178,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let rand_categorical_1 = PrimitiveArray::from_iter(
                 (0..chunk_size).map(|_| rng().random_range(0..rand_categorical_cardinality)),
             );
-            // let compressor = BtrBlocksCompressor::default();
-            // let rand_categorical_1 = compressor.compress(rand_categorical_1.as_ref())?;
 
             let rand_categorical_2 = PrimitiveArray::from_iter(
                 (0..chunk_size).map(|_| rng().random_range(0..rand_categorical_cardinality)),
             );
-            // let compressor = BtrBlocksCompressor::default();
-            // let rand_categorical_2 = compressor.compress(rand_categorical_2.as_ref())?;
 
             let struct_array = StructArray::from_fields(&[
                 (ROW_IDX_COL, row_idxs.into_array()),
@@ -212,8 +199,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let compressor = BtrBlocksCompressor::default();
             let struct_array = compressor.compress(struct_array.as_ref())?;
             compressed_size.fetch_add(struct_array.nbytes(), std::sync::atomic::Ordering::Relaxed);
-            // let ratio = uncompressed_size as f64 / compressed_size as f64;
-            // dbg!(uncompressed_size, compressed_size, ratio);
 
             rows_written += chunk_size;
 
