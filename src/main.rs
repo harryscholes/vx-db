@@ -15,22 +15,25 @@ use rand::{Rng, rng};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 use vortex::{
-    ArrayRef, ArraySession, IntoArray, ToCanonical,
-    arrays::{BoolArray, FixedSizeListArray, PrimitiveArray, StructArray, VarBinViewArray},
+    array::{
+        ArrayRef, IntoArray, ToCanonical,
+        arrays::{BoolArray, FixedSizeListArray, PrimitiveArray, StructArray, VarBinViewArray},
+        session::ArraySession,
+        stream::{ArrayStream, ArrayStreamExt},
+        validity::Validity,
+    },
     buffer::Buffer,
     compute::{Operator, compare},
     dtype::{DType, Nullability, StructFields},
     encodings::sequence::SequenceArray,
     error::VortexResult,
-    expr::{and_collect, col, eq, lit, lt, or_collect, root, select},
+    expr::{and_collect, col, eq, lit, lt, or_collect, root, select, session::ExprSession},
     file::{OpenOptionsSessionExt, WriteOptionsSessionExt},
     io::session::RuntimeSession,
     layout::session::LayoutSession,
     metrics::{Metric, VortexMetrics},
     scan::Selection,
     session::VortexSession,
-    stream::{ArrayStream, ArrayStreamExt},
-    validity::Validity,
 };
 
 const ROW_IDX_COL: &str = "row_idx";
@@ -99,6 +102,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with::<ArraySession>()
         .with::<VortexMetrics>()
         .with::<LayoutSession>()
+        .with::<ExprSession>()
         .with::<RuntimeSession>();
 
     vortex::file::register_default_encodings(&session);
