@@ -4,7 +4,7 @@ use std::{
     fmt::Display,
     path::PathBuf,
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, atomic::AtomicU64},
     task::{Context, Poll},
     time::Instant,
 };
@@ -111,79 +111,127 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let pbar = progress.then(|| Arc::new(Mutex::new(tqdm::pbar(Some(rows)))));
 
-    let chunk_stream = stream::try_unfold((0usize, pbar), move |(rows_written, pbar)| async move {
-        if rows_written >= rows {
-            return Ok(None);
-        }
+    struct StreamState {
+        rows_written: usize,
+        pbar: Option<Arc<Mutex<tqdm::Tqdm<()>>>>,
+        uncompressed_size: Arc<AtomicU64>,
+        compressed_size: Arc<AtomicU64>,
+    }
 
-        let chunk_size = chunk_size.min(rows - rows_written);
+    let uncompressed_size = Arc::new(AtomicU64::new(0));
+    let compressed_size = Arc::new(AtomicU64::new(0));
 
-        let row_idxs =
-            SequenceArray::typed_new(rows_written as u64, 1, Nullability::NonNullable, chunk_size)?
-                .into_array();
+    let chunk_stream = stream::try_unfold(
+        StreamState {
+            rows_written: 0,
+            pbar,
+            uncompressed_size: uncompressed_size.clone(),
+            compressed_size: compressed_size.clone(),
+        },
+        move |state| async move {
+            let StreamState {
+                mut rows_written,
+                pbar,
+                uncompressed_size,
+                compressed_size,
+            } = state;
 
-        let ids =
-            VarBinViewArray::from_iter_str((0..chunk_size).map(|_| Uuid::new_v4().to_string()));
+            if rows_written >= rows {
+                return Ok(None);
+            }
 
-        let vectors = FixedSizeListArray::try_new(
-            PrimitiveArray::from_iter(
-                (0..chunk_size * dimension).map(|_| rng().random_range(-1.0f32..1.0)),
-            )
-            .into_array(),
-            dimension as u32,
-            Validity::NonNullable,
-            chunk_size,
-        )?;
+            let chunk_size = chunk_size.min(rows - rows_written);
 
-        let projections = FixedSizeListArray::try_new(
-            BoolArray::from_iter((0..chunk_size * dimension).map(|_| rng().random_bool(0.5)))
+            let row_idxs = SequenceArray::typed_new(
+                rows_written as u64,
+                1,
+                Nullability::NonNullable,
+                chunk_size,
+            )?
+            .into_array();
+
+            let ids =
+                VarBinViewArray::from_iter_str((0..chunk_size).map(|_| Uuid::new_v4().to_string()));
+
+            let vectors = FixedSizeListArray::try_new(
+                PrimitiveArray::from_iter(
+                    (0..chunk_size * dimension).map(|_| rng().random_range(-1.0f32..1.0)),
+                )
                 .into_array(),
-            dimension as u32,
-            Validity::NonNullable,
-            chunk_size,
-        )?;
+                dimension as u32,
+                Validity::NonNullable,
+                chunk_size,
+            )?;
+            // dbg!(vectors.nbytes());
+            // let compressor = BtrBlocksCompressor::default();
+            // let vectors = compressor.compress(vectors.as_ref())?;
+            // dbg!(vectors.nbytes());
 
-        let ivf_partition_idxs = PrimitiveArray::from_iter(
-            (0..chunk_size).map(|i| ((rows_written + i) / ivf_partition_size) as u32),
-        );
-        let compressor = BtrBlocksCompressor::default();
-        let ivf_partition_idxs = compressor.compress(ivf_partition_idxs.as_ref())?;
+            let projections = FixedSizeListArray::try_new(
+                BoolArray::from_iter((0..chunk_size * dimension).map(|_| rng().random_bool(0.5)))
+                    .into_array(),
+                dimension as u32,
+                Validity::NonNullable,
+                chunk_size,
+            )?;
 
-        let rand_floats =
-            PrimitiveArray::from_iter((0..chunk_size).map(|_| rng().random_range(0.0f64..1.0)));
+            let ivf_partition_idxs = PrimitiveArray::from_iter(
+                (0..chunk_size).map(|i| ((rows_written + i) / ivf_partition_size) as u32),
+            );
+            // let compressor = BtrBlocksCompressor::default();
+            // let ivf_partition_idxs = compressor.compress(ivf_partition_idxs.as_ref())?;
 
-        let rand_categorical_1 = PrimitiveArray::from_iter(
-            (0..chunk_size).map(|_| rng().random_range(0..rand_categorical_cardinality)),
-        );
-        let compressor = BtrBlocksCompressor::default();
-        let rand_categorical_1 = compressor.compress(rand_categorical_1.as_ref())?;
+            let rand_floats =
+                PrimitiveArray::from_iter((0..chunk_size).map(|_| rng().random_range(0.0f64..1.0)));
 
-        let rand_categorical_2 = PrimitiveArray::from_iter(
-            (0..chunk_size).map(|_| rng().random_range(0..rand_categorical_cardinality)),
-        );
-        let compressor = BtrBlocksCompressor::default();
-        let rand_categorical_2 = compressor.compress(rand_categorical_2.as_ref())?;
+            let rand_categorical_1 = PrimitiveArray::from_iter(
+                (0..chunk_size).map(|_| rng().random_range(0..rand_categorical_cardinality)),
+            );
+            // let compressor = BtrBlocksCompressor::default();
+            // let rand_categorical_1 = compressor.compress(rand_categorical_1.as_ref())?;
 
-        let struct_array = StructArray::from_fields(&[
-            (ROW_IDX_COL, row_idxs.into_array()),
-            (ID_COL, ids.into_array()),
-            (VECTOR_COL, vectors.into_array()),
-            (PROJECTION_COL, projections.into_array()),
-            (IVF_PARTITION_IDX_COL, ivf_partition_idxs.into_array()),
-            (RAND_FLOAT_COL, rand_floats.into_array()),
-            (RAND_CATEGORICAL_1_COL, rand_categorical_1.into_array()),
-            (RAND_CATEGORICAL_2_COL, rand_categorical_2.into_array()),
-        ])?;
+            let rand_categorical_2 = PrimitiveArray::from_iter(
+                (0..chunk_size).map(|_| rng().random_range(0..rand_categorical_cardinality)),
+            );
+            // let compressor = BtrBlocksCompressor::default();
+            // let rand_categorical_2 = compressor.compress(rand_categorical_2.as_ref())?;
 
-        if let Some(pbar) = &pbar {
-            _ = pbar.lock().await.update(chunk_size);
-        }
+            let struct_array = StructArray::from_fields(&[
+                (ROW_IDX_COL, row_idxs.into_array()),
+                (ID_COL, ids.into_array()),
+                (VECTOR_COL, vectors.into_array()),
+                (PROJECTION_COL, projections.into_array()),
+                (IVF_PARTITION_IDX_COL, ivf_partition_idxs.into_array()),
+                (RAND_FLOAT_COL, rand_floats.into_array()),
+                (RAND_CATEGORICAL_1_COL, rand_categorical_1.into_array()),
+                (RAND_CATEGORICAL_2_COL, rand_categorical_2.into_array()),
+            ])?;
 
-        Ok(Some((
-            struct_array.into_array(),
-            (rows_written + chunk_size, pbar),
-        )))
-    })
+            uncompressed_size
+                .fetch_add(struct_array.nbytes(), std::sync::atomic::Ordering::Relaxed);
+            let compressor = BtrBlocksCompressor::default();
+            let struct_array = compressor.compress(struct_array.as_ref())?;
+            compressed_size.fetch_add(struct_array.nbytes(), std::sync::atomic::Ordering::Relaxed);
+            // let ratio = uncompressed_size as f64 / compressed_size as f64;
+            // dbg!(uncompressed_size, compressed_size, ratio);
+
+            rows_written += chunk_size;
+
+            if let Some(pbar) = &pbar {
+                _ = pbar.lock().await.update(chunk_size);
+            }
+
+            Ok(Some((
+                struct_array.into_array(),
+                StreamState {
+                    rows_written,
+                    pbar,
+                    uncompressed_size,
+                    compressed_size,
+                },
+            )))
+        },
+    )
     .boxed();
 
     let dtype = DType::Struct(
@@ -236,9 +284,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .write(&mut file, array_stream)
         .await?;
 
-    let file_size = write_summary.size();
-    println!("file size: {:.2} MB", file_size as f64 / (1 << 20) as f64);
+    let uncompressed_size = uncompressed_size.load(std::sync::atomic::Ordering::Relaxed);
+    let compressed_size = compressed_size.load(std::sync::atomic::Ordering::Relaxed);
 
+    println!(
+        "uncompressed size: {:.2} MB, compressed size: {:.2} MB, ratio: {:.2}",
+        uncompressed_size as f64 / (1 << 20) as f64,
+        compressed_size as f64 / (1 << 20) as f64,
+        uncompressed_size as f64 / compressed_size as f64
+    );
+    println!(
+        "file size: {:.2} MB",
+        write_summary.size() as f64 / (1 << 20) as f64
+    );
     println!(
         "write stage elapsed time: {:?}",
         write_stage_start.elapsed()
