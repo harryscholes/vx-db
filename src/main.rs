@@ -4,7 +4,7 @@ use std::{
     fmt::Display,
     path::PathBuf,
     pin::Pin,
-    sync::{Arc, atomic::AtomicU64},
+    sync::Arc,
     task::{Context, Poll},
     time::Instant,
 };
@@ -18,7 +18,6 @@ use vortex::{
     ArrayRef, ArraySession, IntoArray, ToCanonical,
     arrays::{BoolArray, FixedSizeListArray, PrimitiveArray, StructArray, VarBinViewArray},
     buffer::Buffer,
-    compressor::BtrBlocksCompressor,
     compute::{Operator, compare},
     dtype::{DType, Nullability, StructFields},
     encodings::sequence::SequenceArray,
@@ -111,26 +110,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     struct StreamState {
         rows_written: usize,
         pbar: Option<Arc<Mutex<tqdm::Tqdm<()>>>>,
-        uncompressed_size: Arc<AtomicU64>,
-        compressed_size: Arc<AtomicU64>,
     }
-
-    let uncompressed_size = Arc::new(AtomicU64::new(0));
-    let compressed_size = Arc::new(AtomicU64::new(0));
 
     let chunk_stream = stream::try_unfold(
         StreamState {
             rows_written: 0,
             pbar,
-            uncompressed_size: uncompressed_size.clone(),
-            compressed_size: compressed_size.clone(),
         },
         move |state| async move {
             let StreamState {
                 mut rows_written,
                 pbar,
-                uncompressed_size,
-                compressed_size,
             } = state;
 
             if rows_written >= rows {
@@ -194,12 +184,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 (RAND_CATEGORICAL_2_COL, rand_categorical_2.into_array()),
             ])?;
 
-            uncompressed_size
-                .fetch_add(struct_array.nbytes(), std::sync::atomic::Ordering::Relaxed);
-            let compressor = BtrBlocksCompressor::default();
-            let struct_array = compressor.compress(struct_array.as_ref())?;
-            compressed_size.fetch_add(struct_array.nbytes(), std::sync::atomic::Ordering::Relaxed);
-
             rows_written += chunk_size;
 
             if let Some(pbar) = &pbar {
@@ -208,12 +192,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             Ok(Some((
                 struct_array.into_array(),
-                StreamState {
-                    rows_written,
-                    pbar,
-                    uncompressed_size,
-                    compressed_size,
-                },
+                StreamState { rows_written, pbar },
             )))
         },
     )
@@ -269,19 +248,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .write(&mut file, array_stream)
         .await?;
 
-    let uncompressed_size = uncompressed_size.load(std::sync::atomic::Ordering::Relaxed);
-    let compressed_size = compressed_size.load(std::sync::atomic::Ordering::Relaxed);
+    let expected_uncompressed_size = rows
+        * (
+            size_of::<u64>() // row_idx
+            + Uuid::new_v4().to_string().len() // id
+            + size_of::<f32>() * dimension // vector
+            + dimension / 8 // projection
+            + size_of::<u32>() // ivf_partition_idx
+            + size_of::<f64>() // rand_float
+            + 2 * size_of::<u32>()
+            // rand_categorical_1, rand_categorical_2
+        );
+    let actual_compressed_size = write_summary.size();
+    let ratio = expected_uncompressed_size as f64 / actual_compressed_size as f64;
+    println!(
+        "expected size: {:.2} MB, actual size: {:.2} MB, ratio: {:.2}",
+        expected_uncompressed_size as f64 / (1 << 20) as f64,
+        actual_compressed_size as f64 / (1 << 20) as f64,
+        ratio
+    );
 
-    println!(
-        "uncompressed size: {:.2} MB, compressed size: {:.2} MB, ratio: {:.2}",
-        uncompressed_size as f64 / (1 << 20) as f64,
-        compressed_size as f64 / (1 << 20) as f64,
-        uncompressed_size as f64 / compressed_size as f64
-    );
-    println!(
-        "file size: {:.2} MB",
-        write_summary.size() as f64 / (1 << 20) as f64
-    );
     println!(
         "write stage elapsed time: {:?}",
         write_stage_start.elapsed()
