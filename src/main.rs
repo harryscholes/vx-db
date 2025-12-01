@@ -50,6 +50,8 @@ struct Opt {
     rows: usize,
     #[arg(long, short = 'd', default_value_t = 1024)]
     dimension: usize,
+    #[arg(long, short = 'b', default_value_t = 1.0)]
+    projection_bits: f64,
     #[arg(long, short = 'c', default_value_t = 1024)]
     chunk_size: usize,
     #[arg(long, short = 'k', default_value_t = 10)]
@@ -81,6 +83,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         rows,
         chunk_size,
         dimension,
+        projection_bits,
         top_k,
         queries,
         tombstones,
@@ -101,6 +104,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     vortex::file::register_default_encodings(&session);
 
     let write_stage_start = Instant::now();
+
+    let projection_bits = (projection_bits * dimension as f64) as usize;
 
     let ivf_partitions = rows.isqrt();
     let ivf_partition_size = (rows + ivf_partitions - 1) / ivf_partitions;
@@ -151,9 +156,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )?;
 
             let projections = FixedSizeListArray::try_new(
-                BoolArray::from_iter((0..chunk_size * dimension).map(|_| rng().random_bool(0.5)))
-                    .into_array(),
-                dimension as u32,
+                BoolArray::from_iter(
+                    (0..chunk_size * projection_bits).map(|_| rng().random_bool(0.5)),
+                )
+                .into_array(),
+                projection_bits as u32,
                 Validity::NonNullable,
                 chunk_size,
             )?;
@@ -293,7 +300,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let query_start = Instant::now();
 
         let query_projection =
-            BoolArray::from_iter((0..opt.dimension).map(|_| rng().random_bool(0.5)));
+            BoolArray::from_iter((0..projection_bits).map(|_| rng().random_bool(0.5)));
         let nprobe = ivf_partitions.isqrt();
         let query_ivf_partition_idxs = (0..nprobe).map(|_| rng().random_range(0..ivf_partitions));
         let query_rand_categorical_1 = rng().random_range(0..rand_categorical_cardinality);
