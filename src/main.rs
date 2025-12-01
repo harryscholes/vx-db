@@ -57,6 +57,8 @@ struct Opt {
     top_k: usize,
     #[arg(long, short = 'q', default_value_t = 100)]
     queries: usize,
+    #[arg(long, short = 't', default_value_t = 0.01)]
+    tombstones: f64,
     #[arg(long)]
     include_values: bool,
     #[arg(long)]
@@ -82,6 +84,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         dimension,
         top_k,
         queries,
+        tombstones,
         include_values,
         include_metadata,
         progress,
@@ -245,6 +248,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let file = session.open_options().open(path).await.unwrap();
 
+    let mut tombstone_idxs =
+        rand::seq::index::sample(&mut rand::rng(), rows, (rows as f64 * tombstones) as usize)
+            .into_iter()
+            .map(|idx| idx as u64)
+            .collect::<Vec<_>>();
+    tombstone_idxs.sort();
+    let tombstone_idxs = Buffer::from_iter(tombstone_idxs);
+
     let metrics = file.metrics();
 
     let pbar = progress.then(|| Arc::new(Mutex::new(tqdm::pbar(Some(queries)))));
@@ -261,6 +272,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let stream = file
             .scan()?
+            .with_selection(Selection::ExcludeByIndex(tombstone_idxs.clone()))
             .with_filter(
                 and_collect(vec![
                     or_collect(
