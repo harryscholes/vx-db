@@ -264,7 +264,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             size_of::<u64>() // row_idx
             + Uuid::new_v4().to_string().len() // id
             + size_of::<f32>() * dimension // vector
-            + dimension / 8 // projection
+            + projection_bits.div_ceil(u8::BITS as usize) // projection
             + size_of::<u32>() // ivf_partition_idx
             + size_of::<f64>() // rand_float
             + 2 * size_of::<u32>()
