@@ -107,6 +107,18 @@ struct ReadArgs {
     print_results: bool,
 }
 
+fn create_session() -> VortexSession {
+    let session = VortexSession::empty()
+        .with::<ArraySession>()
+        .with::<VortexMetrics>()
+        .with::<LayoutSession>()
+        .with::<ExprSession>()
+        .with::<RuntimeSession>();
+
+    vortex::file::register_default_encodings(&session);
+    session
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let opt = Opt::parse();
@@ -128,14 +140,7 @@ async fn write_command(args: WriteArgs) -> Result<(), Box<dyn std::error::Error>
         progress,
     } = args;
 
-    let session = VortexSession::empty()
-        .with::<ArraySession>()
-        .with::<VortexMetrics>()
-        .with::<LayoutSession>()
-        .with::<ExprSession>()
-        .with::<RuntimeSession>();
-
-    vortex::file::register_default_encodings(&session);
+    let session = create_session();
 
     let write_stage_start = Instant::now();
 
@@ -334,14 +339,7 @@ async fn read_command(args: ReadArgs) -> Result<(), Box<dyn std::error::Error>> 
         print_results,
     } = args;
 
-    let session = VortexSession::empty()
-        .with::<ArraySession>()
-        .with::<VortexMetrics>()
-        .with::<LayoutSession>()
-        .with::<ExprSession>()
-        .with::<RuntimeSession>();
-
-    vortex::file::register_default_encodings(&session);
+    let session = create_session();
 
     let read_stage_start = Instant::now();
 
@@ -349,7 +347,7 @@ async fn read_command(args: ReadArgs) -> Result<(), Box<dyn std::error::Error>> 
 
     let ivf_partitions = rows.isqrt();
 
-    let file = session.open_options().open(path).await.unwrap();
+    let file = session.open_options().open(path).await?;
 
     let mut tombstone_idxs =
         rand::seq::index::sample(&mut rand::rng(), rows, (rows as f64 * tombstones) as usize)
