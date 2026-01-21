@@ -19,3 +19,6 @@ vortex = { git = "https://github.com/vortex-data/vortex.git", rev = "a09481cd7df
     "tokio",
 ] } # Specific commit
 # vortex = { path = "../vortex/vortex", features = ["tokio"] } # Local workspace version
+
+[dev-dependencies]
+tempfile = "3"
