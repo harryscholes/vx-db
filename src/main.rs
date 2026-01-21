@@ -18,7 +18,6 @@ use vortex::{
     array::{
         ArrayRef, IntoArray, ToCanonical,
         arrays::{BoolArray, FixedSizeListArray, PrimitiveArray, StructArray, VarBinViewArray},
-        session::ArraySession,
         stream::{ArrayStream, ArrayStreamExt},
         validity::Validity,
     },
@@ -27,23 +26,15 @@ use vortex::{
     dtype::{DType, Nullability, StructFields},
     encodings::sequence::SequenceArray,
     error::VortexResult,
-    expr::{and_collect, col, eq, lit, lt, or_collect, root, select, session::ExprSession},
+    expr::{and_collect, col, eq, lit, lt, or_collect, root, select},
     file::{OpenOptionsSessionExt, WriteOptionsSessionExt},
-    io::session::RuntimeSession,
-    layout::session::LayoutSession,
-    metrics::{Metric, VortexMetrics},
+    metrics::Metric,
     scan::Selection,
-    session::VortexSession,
 };
-
-const ROW_IDX_COL: &str = "row_idx";
-const ID_COL: &str = "id";
-const VECTOR_COL: &str = "vector";
-const PROJECTION_COL: &str = "projection";
-const IVF_PARTITION_IDX_COL: &str = "ivf_partition_idx";
-const RAND_FLOAT_COL: &str = "rand_float";
-const RAND_CATEGORICAL_1_COL: &str = "rand_categorical_1";
-const RAND_CATEGORICAL_2_COL: &str = "rand_categorical_2";
+use vx_db::{
+    ID_COL, IVF_PARTITION_IDX_COL, PROJECTION_COL, RAND_CATEGORICAL_1_COL, RAND_CATEGORICAL_2_COL,
+    RAND_FLOAT_COL, ROW_IDX_COL, VECTOR_COL, create_session,
+};
 
 #[derive(Debug, Parser)]
 struct Opt {
@@ -105,18 +96,6 @@ struct ReadArgs {
     rand_float_selectivity: f64,
     #[arg(long)]
     print_results: bool,
-}
-
-fn create_session() -> VortexSession {
-    let session = VortexSession::empty()
-        .with::<ArraySession>()
-        .with::<VortexMetrics>()
-        .with::<LayoutSession>()
-        .with::<ExprSession>()
-        .with::<RuntimeSession>();
-
-    vortex::file::register_default_encodings(&session);
-    session
 }
 
 #[tokio::main]
