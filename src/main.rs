@@ -9,7 +9,7 @@ use std::{
     time::Instant,
 };
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use futures_util::{Stream, StreamExt, stream};
 use rand::{Rng, rng};
 use tokio::sync::Mutex;
@@ -47,6 +47,20 @@ const RAND_CATEGORICAL_2_COL: &str = "rand_categorical_2";
 
 #[derive(Debug, Parser)]
 struct Opt {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Debug, Subcommand)]
+enum Commands {
+    /// Write data to a Vortex file
+    Write(WriteArgs),
+    /// Read and query data from a Vortex file
+    Read(ReadArgs),
+}
+
+#[derive(Debug, Parser)]
+struct WriteArgs {
     #[arg(long, short = 'f', default_value = "db.vortex")]
     path: PathBuf,
     #[arg(long, short = 'n', default_value_t = 1024)]
@@ -57,6 +71,22 @@ struct Opt {
     projection_bits: f64,
     #[arg(long, short = 'c', default_value_t = 1024)]
     chunk_size: usize,
+    #[arg(long, default_value_t = 5)]
+    rand_categorical_cardinality: u32,
+    #[arg(long)]
+    progress: bool,
+}
+
+#[derive(Debug, Parser)]
+struct ReadArgs {
+    #[arg(long, short = 'f', default_value = "db.vortex")]
+    path: PathBuf,
+    #[arg(long, short = 'n', default_value_t = 1024)]
+    rows: usize,
+    #[arg(long, short = 'd', default_value_t = 1024)]
+    dimension: usize,
+    #[arg(long, short = 'b', default_value_t = 1.0)]
+    projection_bits: f64,
     #[arg(long, short = 'k', default_value_t = 10)]
     top_k: usize,
     #[arg(long, short = 'q', default_value_t = 100)]
@@ -77,27 +107,7 @@ struct Opt {
     print_results: bool,
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let opt = Opt::parse();
-
-    let Opt {
-        path,
-        rows,
-        chunk_size,
-        dimension,
-        projection_bits,
-        top_k,
-        queries,
-        tombstones,
-        include_values,
-        include_metadata,
-        progress,
-        rand_categorical_cardinality,
-        rand_float_selectivity,
-        print_results,
-    } = opt;
-
+fn create_session() -> VortexSession {
     let session = VortexSession::empty()
         .with::<ArraySession>()
         .with::<VortexMetrics>()
@@ -106,6 +116,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with::<RuntimeSession>();
 
     vortex::file::register_default_encodings(&session);
+    session
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let opt = Opt::parse();
+
+    match opt.command {
+        Commands::Write(args) => write_command(args).await,
+        Commands::Read(args) => read_command(args).await,
+    }
+}
+
+async fn write_command(args: WriteArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let WriteArgs {
+        path,
+        rows,
+        dimension,
+        projection_bits,
+        chunk_size,
+        rand_categorical_cardinality,
+        progress,
+    } = args;
+
+    let session = create_session();
 
     let write_stage_start = Instant::now();
 
@@ -235,7 +270,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ),
                 DType::FixedSizeList(
                     Arc::new(DType::Bool(Nullability::NonNullable)),
-                    dimension as u32,
+                    projection_bits as u32,
                     Nullability::NonNullable,
                 ),
                 DType::Primitive(vortex::dtype::PType::U32, Nullability::NonNullable),
@@ -284,9 +319,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         write_stage_start.elapsed()
     );
 
+    Ok(())
+}
+
+async fn read_command(args: ReadArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let ReadArgs {
+        path,
+        rows,
+        dimension,
+        projection_bits,
+        top_k,
+        queries,
+        tombstones,
+        include_values,
+        include_metadata,
+        progress,
+        rand_categorical_cardinality,
+        rand_float_selectivity,
+        print_results,
+    } = args;
+
+    let session = create_session();
+
     let read_stage_start = Instant::now();
 
-    let file = session.open_options().open(path).await.unwrap();
+    let projection_bits = (projection_bits * dimension as f64) as usize;
+
+    let ivf_partitions = rows.isqrt();
+
+    let file = session.open_options().open(path).await?;
 
     let mut tombstone_idxs =
         rand::seq::index::sample(&mut rand::rng(), rows, (rows as f64 * tombstones) as usize)
@@ -387,14 +448,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        let top_k = heap.into_sorted_vec();
+        let top_k_results = heap.into_sorted_vec();
 
-        let id_to_distance = top_k
+        let id_to_distance = top_k_results
             .iter()
             .map(|h| (h.id.clone(), h.distance))
             .collect::<HashMap<_, _>>();
 
-        let mut row_idxs = top_k.iter().map(|h| h.row_idx).collect::<Vec<_>>();
+        let mut row_idxs = top_k_results.iter().map(|h| h.row_idx).collect::<Vec<_>>();
         row_idxs.sort();
         let selection = Selection::IncludeByIndex(Buffer::from_iter(row_idxs));
 
