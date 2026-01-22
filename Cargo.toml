@@ -6,6 +6,14 @@ edition = "2024"
 description = "A vector database on top of Vortex"
 repository = "https://github.com/harryscholes/vx-db"
 
+[lib]
+name = "vx_db"
+path = "src/lib.rs"
+
+[[bin]]
+name = "vx-db"
+path = "src/main.rs"
+
 [dependencies]
 clap = { version = "4.5.53", features = ["derive"] }
 futures-util = "0.3.31"
@@ -19,3 +27,6 @@ vortex = { git = "https://github.com/vortex-data/vortex.git", rev = "a09481cd7df
     "tokio",
 ] } # Specific commit
 # vortex = { path = "../vortex/vortex", features = ["tokio"] } # Local workspace version
+
+[dev-dependencies]
+tempfile = "3"
