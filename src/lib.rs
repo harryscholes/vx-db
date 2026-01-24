@@ -372,10 +372,16 @@ pub async fn read_command(config: ReadConfig) -> Result<(), Box<dyn std::error::
 
                 if heap.len() < top_k {
                     let row_idx = row_idxs.scalar_at(i);
-                    let row_idx = row_idx.as_primitive().typed_value().unwrap();
+                    let row_idx = row_idx
+                        .as_primitive()
+                        .typed_value()
+                        .expect("row_idx should be a valid u64 value");
 
                     let id = ids.scalar_at(i);
-                    let id = id.as_utf8().value().unwrap();
+                    let id = id
+                        .as_utf8()
+                        .value()
+                        .expect("id should be a valid UTF8 value");
                     let id = id.as_str();
 
                     heap.push(HeapElement {
@@ -387,10 +393,16 @@ pub async fn read_command(config: ReadConfig) -> Result<(), Box<dyn std::error::
                     && distance < min.distance
                 {
                     let row_idx = row_idxs.scalar_at(i);
-                    let row_idx = row_idx.as_primitive().typed_value().unwrap();
+                    let row_idx = row_idx
+                        .as_primitive()
+                        .typed_value()
+                        .expect("row_idx should be a valid u64 value");
 
                     let id = ids.scalar_at(i);
-                    let id = id.as_utf8().value().unwrap();
+                    let id = id
+                        .as_utf8()
+                        .value()
+                        .expect("id should be a valid UTF8 value");
                     let id = id.as_str();
 
                     heap.pop();
@@ -442,35 +454,56 @@ pub async fn read_command(config: ReadConfig) -> Result<(), Box<dyn std::error::
         let mut results = (0..s.len())
             .map(|i| {
                 let id_scalar = ids.scalar_at(i);
-                let id_utf8_value = id_scalar.as_utf8().value().unwrap();
+                let id_utf8_value = id_scalar
+                    .as_utf8()
+                    .value()
+                    .expect("id should be a valid UTF8 value");
                 let id = id_utf8_value.as_str().to_string();
 
-                let distance = *id_to_distance.get(&id).unwrap();
+                let distance = *id_to_distance
+                    .get(&id)
+                    .expect("id should exist in distance map");
 
                 let vector = include_values.then(|| {
-                    let vectors = vectors.as_ref().unwrap().to_fixed_size_list();
+                    let vectors = vectors
+                        .as_ref()
+                        .expect("vectors field should be present when include_values is true")
+                        .to_fixed_size_list();
                     vectors.fixed_size_list_elements_at(i).to_primitive()
                 });
 
                 let metadata = include_metadata.then(|| {
-                    let rand_floats = rand_floats.as_ref().unwrap().to_primitive();
+                    let rand_floats = rand_floats
+                        .as_ref()
+                        .expect("rand_floats field should be present when include_metadata is true")
+                        .to_primitive();
                     let rand_float = rand_floats
                         .scalar_at(i)
                         .as_primitive()
                         .typed_value()
-                        .unwrap();
-                    let rand_categorical_1 = rand_categorical_1.as_ref().unwrap().to_primitive();
+                        .expect("rand_float should be a valid f64 value");
+                    let rand_categorical_1 = rand_categorical_1
+                        .as_ref()
+                        .expect(
+                            "rand_categorical_1 field should be present when include_metadata is true",
+                        )
+                        .to_primitive();
                     let rand_categorical_1 = rand_categorical_1
                         .scalar_at(i)
                         .as_primitive()
                         .typed_value()
-                        .unwrap();
-                    let rand_categorical_2 = rand_categorical_2.as_ref().unwrap().to_primitive();
+                        .expect("rand_categorical_1 should be a valid u32 value");
+                    let rand_categorical_2 = rand_categorical_2
+                        .as_ref()
+                        .expect(
+                            "rand_categorical_2 field should be present when include_metadata is true",
+                        )
+                        .to_primitive();
                     let rand_categorical_2 = rand_categorical_2
                         .scalar_at(i)
                         .as_primitive()
                         .typed_value()
-                        .unwrap();
+                        .expect("rand_categorical_2 should be a valid u32 value");
                     (rand_float, rand_categorical_1, rand_categorical_2)
                 });
 
@@ -521,14 +554,20 @@ pub async fn read_command(config: ReadConfig) -> Result<(), Box<dyn std::error::
                 let p50 = snapshot.value(0.5);
                 let p90 = snapshot.value(0.9);
                 let p99 = snapshot.value(0.99);
-                println!("histogram {name}: p50={p50}, p90={p90}, p99={p99}");
+                println!(
+                    "histogram {name}: p50={:.2}ns, p90={:.2}ns, p99={:.2}ns",
+                    p50, p90, p99
+                );
             }
             Metric::Timer(timer) => {
                 let snapshot = timer.snapshot();
                 let p50 = snapshot.value(0.5);
                 let p90 = snapshot.value(0.9);
                 let p99 = snapshot.value(0.99);
-                println!("timer {name}: p50={p50}, p90={p90}, p99={p99}");
+                println!(
+                    "timer {name}: p50={:.2}ns, p90={:.2}ns, p99={:.2}ns",
+                    p50, p90, p99
+                );
             }
             _ => {}
         }
