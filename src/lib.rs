@@ -213,7 +213,7 @@ pub async fn write_command(config: WriteConfig) -> Result<()> {
             rows_written += chunk_size;
 
             if let Some(pbar) = &pbar {
-                _ = pbar.lock().await.update(chunk_size);
+                let _ = pbar.lock().await.update(chunk_size);
             }
 
             Ok(Some((
@@ -370,12 +370,12 @@ pub async fn read_command(config: ReadConfig) -> Result<()> {
                             .into_iter()
                             .map(|idx| eq(col(IVF_PARTITION_IDX_COL), lit(idx as u32))),
                     )
-                    .unwrap(),
+                    .ok_or_else(|| anyhow::anyhow!("empty IVF partition filter"))?,
                     eq(col(RAND_CATEGORICAL_1_COL), lit(query_rand_categorical_1)),
                     eq(col(RAND_CATEGORICAL_2_COL), lit(query_rand_categorical_2)),
                     lt(col(RAND_FLOAT_COL), lit(rand_float_selectivity)),
                 ])
-                .unwrap(),
+                .ok_or_else(|| anyhow::anyhow!("empty filter"))?,
             )
             .with_projection(select([ROW_IDX_COL, ID_COL, PROJECTION_COL], root()))
             .into_array_stream()?;
@@ -549,12 +549,12 @@ pub async fn read_command(config: ReadConfig) -> Result<()> {
             .update(query_start.elapsed().as_nanos() as i64);
 
         if let Some(pbar) = &pbar {
-            _ = pbar.lock().await.update(1);
+            let _ = pbar.lock().await.update(1);
         }
     }
 
     if let Some(pbar) = &pbar {
-        _ = pbar.lock().await.close();
+        let _ = pbar.lock().await.close();
     }
 
     println!("read stage elapsed time: {:?}", read_stage_start.elapsed());
