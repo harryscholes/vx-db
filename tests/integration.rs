@@ -1,24 +1,23 @@
 use tempfile::TempDir;
-use vx_db::{ReadConfig, WriteConfig, read_command, write_command};
+use vx_db::{DatabaseConfig, ReadConfig, WriteConfig, read_command, write_command};
 
 #[tokio::test]
 async fn test_write_then_read() {
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().join("test.vortex");
 
-    let rows = 100;
-    let dimension = 64;
-    let projection_bits = 1.0;
-    let rand_categorical_cardinality = 3;
+    let db = DatabaseConfig {
+        rows: 100,
+        dimension: 64,
+        projection_bits: 1.0,
+        rand_categorical_cardinality: 3,
+    };
 
     // Write data
     write_command(WriteConfig {
         path: db_path.clone(),
-        rows,
-        dimension,
-        projection_bits,
+        db: db.clone(),
         chunk_size: 50,
-        rand_categorical_cardinality,
         progress: false,
     })
     .await
@@ -34,16 +33,13 @@ async fn test_write_then_read() {
     // Read data back - use matching parameters
     read_command(ReadConfig {
         path: db_path,
-        rows,
-        dimension,
-        projection_bits,
+        db,
         top_k: 5,
         queries: 1,
         tombstones: 0.0,
         include_values: true,
         include_metadata: true,
         progress: false,
-        rand_categorical_cardinality,
         rand_float_selectivity: 1.0,
         print_results: false,
     })

@@ -1,3 +1,8 @@
+//! A proof-of-concept vector database built on Vortex.
+//!
+//! This crate provides functionality to write and read vector data using
+//! IVF partitioning and binary projections for approximate nearest neighbor search.
+
 use std::{
     cmp::Ordering,
     collections::{BinaryHeap, HashMap},
@@ -9,8 +14,9 @@ use std::{
     time::Instant,
 };
 
+use anyhow::Result;
 use futures_util::{Stream, StreamExt, stream};
-use rand::{Rng, rng};
+use rand::Rng;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 use vortex::{
@@ -35,6 +41,7 @@ use vortex::{
     session::VortexSession,
 };
 
+// Column name constants
 pub const ROW_IDX_COL: &str = "row_idx";
 pub const ID_COL: &str = "id";
 pub const VECTOR_COL: &str = "vector";
@@ -44,34 +51,41 @@ pub const RAND_FLOAT_COL: &str = "rand_float";
 pub const RAND_CATEGORICAL_1_COL: &str = "rand_categorical_1";
 pub const RAND_CATEGORICAL_2_COL: &str = "rand_categorical_2";
 
+/// Shared database configuration for vector storage parameters.
+#[derive(Debug, Clone)]
+pub struct DatabaseConfig {
+    pub rows: usize,
+    pub dimension: usize,
+    /// Projection bits as a ratio of dimension (e.g., 1.0 means dimension bits).
+    pub projection_bits: f64,
+    pub rand_categorical_cardinality: u32,
+}
+
+/// Configuration for writing data to a Vortex file.
 #[derive(Debug, Clone)]
 pub struct WriteConfig {
     pub path: PathBuf,
-    pub rows: usize,
-    pub dimension: usize,
-    pub projection_bits: f64,
+    pub db: DatabaseConfig,
     pub chunk_size: usize,
-    pub rand_categorical_cardinality: u32,
     pub progress: bool,
 }
 
+/// Configuration for reading and querying data from a Vortex file.
 #[derive(Debug, Clone)]
 pub struct ReadConfig {
     pub path: PathBuf,
-    pub rows: usize,
-    pub dimension: usize,
-    pub projection_bits: f64,
+    pub db: DatabaseConfig,
     pub top_k: usize,
     pub queries: usize,
     pub tombstones: f64,
     pub include_values: bool,
     pub include_metadata: bool,
     pub progress: bool,
-    pub rand_categorical_cardinality: u32,
     pub rand_float_selectivity: f64,
     pub print_results: bool,
 }
 
+/// Creates a new Vortex session with all required components.
 pub fn create_session() -> VortexSession {
     let session = VortexSession::empty()
         .with::<ArraySession>()
@@ -84,14 +98,18 @@ pub fn create_session() -> VortexSession {
     session
 }
 
-pub async fn write_command(config: WriteConfig) -> Result<(), Box<dyn std::error::Error>> {
+/// Writes synthetic vector data to a Vortex file.
+pub async fn write_command(config: WriteConfig) -> Result<()> {
     let WriteConfig {
         path,
-        rows,
-        dimension,
-        projection_bits,
+        db:
+            DatabaseConfig {
+                rows,
+                dimension,
+                projection_bits,
+                rand_categorical_cardinality,
+            },
         chunk_size,
-        rand_categorical_cardinality,
         progress,
     } = config;
 
@@ -128,67 +146,74 @@ pub async fn write_command(config: WriteConfig) -> Result<(), Box<dyn std::error
 
             let chunk_size = chunk_size.min(rows - rows_written);
 
-            let row_idxs = SequenceArray::typed_new(
-                rows_written as u64,
-                1,
-                Nullability::NonNullable,
-                chunk_size,
-            )?
-            .into_array();
+            // Scope the RNG to ensure it's dropped before any await points
+            let struct_array = {
+                let mut rng = rand::rng();
 
-            let ids =
-                VarBinViewArray::from_iter_str((0..chunk_size).map(|_| Uuid::new_v4().to_string()));
+                let row_idxs = SequenceArray::typed_new(
+                    rows_written as u64,
+                    1,
+                    Nullability::NonNullable,
+                    chunk_size,
+                )?
+                .into_array();
 
-            let vectors = FixedSizeListArray::try_new(
-                PrimitiveArray::from_iter(
-                    (0..chunk_size * dimension).map(|_| rng().random_range(-1.0f32..1.0)),
-                )
-                .into_array(),
-                dimension as u32,
-                Validity::NonNullable,
-                chunk_size,
-            )?;
+                let ids = VarBinViewArray::from_iter_str(
+                    (0..chunk_size).map(|_| Uuid::new_v4().to_string()),
+                );
 
-            let projections = FixedSizeListArray::try_new(
-                BoolArray::from_iter(
-                    (0..chunk_size * projection_bits).map(|_| rng().random_bool(0.5)),
-                )
-                .into_array(),
-                projection_bits as u32,
-                Validity::NonNullable,
-                chunk_size,
-            )?;
+                let vectors = FixedSizeListArray::try_new(
+                    PrimitiveArray::from_iter(
+                        (0..chunk_size * dimension).map(|_| rng.random_range(-1.0f32..1.0)),
+                    )
+                    .into_array(),
+                    dimension as u32,
+                    Validity::NonNullable,
+                    chunk_size,
+                )?;
 
-            let ivf_partition_idxs = PrimitiveArray::from_iter(
-                (0..chunk_size).map(|i| ((rows_written + i) / ivf_partition_size) as u32),
-            );
+                let projections = FixedSizeListArray::try_new(
+                    BoolArray::from_iter(
+                        (0..chunk_size * projection_bits).map(|_| rng.random_bool(0.5)),
+                    )
+                    .into_array(),
+                    projection_bits as u32,
+                    Validity::NonNullable,
+                    chunk_size,
+                )?;
 
-            let rand_floats =
-                PrimitiveArray::from_iter((0..chunk_size).map(|_| rng().random_range(0.0f64..1.0)));
+                let ivf_partition_idxs = PrimitiveArray::from_iter(
+                    (0..chunk_size).map(|i| ((rows_written + i) / ivf_partition_size) as u32),
+                );
 
-            let rand_categorical_1 = PrimitiveArray::from_iter(
-                (0..chunk_size).map(|_| rng().random_range(0..rand_categorical_cardinality)),
-            );
+                let rand_floats = PrimitiveArray::from_iter(
+                    (0..chunk_size).map(|_| rng.random_range(0.0f64..1.0)),
+                );
 
-            let rand_categorical_2 = PrimitiveArray::from_iter(
-                (0..chunk_size).map(|_| rng().random_range(0..rand_categorical_cardinality)),
-            );
+                let rand_categorical_1 = PrimitiveArray::from_iter(
+                    (0..chunk_size).map(|_| rng.random_range(0..rand_categorical_cardinality)),
+                );
 
-            let struct_array = StructArray::from_fields(&[
-                (ROW_IDX_COL, row_idxs.into_array()),
-                (ID_COL, ids.into_array()),
-                (VECTOR_COL, vectors.into_array()),
-                (PROJECTION_COL, projections.into_array()),
-                (IVF_PARTITION_IDX_COL, ivf_partition_idxs.into_array()),
-                (RAND_FLOAT_COL, rand_floats.into_array()),
-                (RAND_CATEGORICAL_1_COL, rand_categorical_1.into_array()),
-                (RAND_CATEGORICAL_2_COL, rand_categorical_2.into_array()),
-            ])?;
+                let rand_categorical_2 = PrimitiveArray::from_iter(
+                    (0..chunk_size).map(|_| rng.random_range(0..rand_categorical_cardinality)),
+                );
+
+                StructArray::from_fields(&[
+                    (ROW_IDX_COL, row_idxs.into_array()),
+                    (ID_COL, ids.into_array()),
+                    (VECTOR_COL, vectors.into_array()),
+                    (PROJECTION_COL, projections.into_array()),
+                    (IVF_PARTITION_IDX_COL, ivf_partition_idxs.into_array()),
+                    (RAND_FLOAT_COL, rand_floats.into_array()),
+                    (RAND_CATEGORICAL_1_COL, rand_categorical_1.into_array()),
+                    (RAND_CATEGORICAL_2_COL, rand_categorical_2.into_array()),
+                ])?
+            };
 
             rows_written += chunk_size;
 
             if let Some(pbar) = &pbar {
-                _ = pbar.lock().await.update(chunk_size);
+                let _ = pbar.lock().await.update(chunk_size);
             }
 
             Ok(Some((
@@ -277,19 +302,23 @@ pub async fn write_command(config: WriteConfig) -> Result<(), Box<dyn std::error
     Ok(())
 }
 
-pub async fn read_command(config: ReadConfig) -> Result<(), Box<dyn std::error::Error>> {
+/// Reads and queries vector data from a Vortex file.
+pub async fn read_command(config: ReadConfig) -> Result<()> {
     let ReadConfig {
         path,
-        rows,
-        dimension,
-        projection_bits,
+        db:
+            DatabaseConfig {
+                rows,
+                dimension,
+                projection_bits,
+                rand_categorical_cardinality,
+            },
         top_k,
         queries,
         tombstones,
         include_values,
         include_metadata,
         progress,
-        rand_categorical_cardinality,
         rand_float_selectivity,
         print_results,
     } = config;
@@ -301,11 +330,15 @@ pub async fn read_command(config: ReadConfig) -> Result<(), Box<dyn std::error::
     let projection_bits = (projection_bits * dimension as f64) as usize;
 
     let ivf_partitions = rows.isqrt();
+    // nprobe = sqrt(partitions) = sqrt(sqrt(rows)), balancing recall vs. performance
+    let nprobe = ivf_partitions.isqrt();
 
     let file = session.open_options().open(path).await?;
 
+    let mut rng = rand::rng();
+
     let mut tombstone_idxs =
-        rand::seq::index::sample(&mut rand::rng(), rows, (rows as f64 * tombstones) as usize)
+        rand::seq::index::sample(&mut rng, rows, (rows as f64 * tombstones) as usize)
             .into_iter()
             .map(|idx| idx as u64)
             .collect::<Vec<_>>();
@@ -320,11 +353,12 @@ pub async fn read_command(config: ReadConfig) -> Result<(), Box<dyn std::error::
         let query_start = Instant::now();
 
         let query_projection =
-            BoolArray::from_iter((0..projection_bits).map(|_| rng().random_bool(0.5)));
-        let nprobe = ivf_partitions.isqrt();
-        let query_ivf_partition_idxs = (0..nprobe).map(|_| rng().random_range(0..ivf_partitions));
-        let query_rand_categorical_1 = rng().random_range(0..rand_categorical_cardinality);
-        let query_rand_categorical_2 = rng().random_range(0..rand_categorical_cardinality);
+            BoolArray::from_iter((0..projection_bits).map(|_| rng.random_bool(0.5)));
+        let query_ivf_partition_idxs: Vec<_> = (0..nprobe)
+            .map(|_| rng.random_range(0..ivf_partitions))
+            .collect();
+        let query_rand_categorical_1 = rng.random_range(0..rand_categorical_cardinality);
+        let query_rand_categorical_2 = rng.random_range(0..rand_categorical_cardinality);
 
         let stream = file
             .scan()?
@@ -333,14 +367,15 @@ pub async fn read_command(config: ReadConfig) -> Result<(), Box<dyn std::error::
                 and_collect(vec![
                     or_collect(
                         query_ivf_partition_idxs
+                            .into_iter()
                             .map(|idx| eq(col(IVF_PARTITION_IDX_COL), lit(idx as u32))),
                     )
-                    .unwrap(),
+                    .ok_or_else(|| anyhow::anyhow!("empty IVF partition filter"))?,
                     eq(col(RAND_CATEGORICAL_1_COL), lit(query_rand_categorical_1)),
                     eq(col(RAND_CATEGORICAL_2_COL), lit(query_rand_categorical_2)),
                     lt(col(RAND_FLOAT_COL), lit(rand_float_selectivity)),
                 ])
-                .unwrap(),
+                .ok_or_else(|| anyhow::anyhow!("empty filter"))?,
             )
             .with_projection(select([ROW_IDX_COL, ID_COL, PROJECTION_COL], root()))
             .into_array_stream()?;
@@ -370,45 +405,30 @@ pub async fn read_command(config: ReadConfig) -> Result<(), Box<dyn std::error::
                 .as_bool_typed()
                 .true_count()?;
 
-                if heap.len() < top_k {
-                    let row_idx = row_idxs.scalar_at(i);
-                    let row_idx = row_idx
+                let should_insert =
+                    heap.len() < top_k || heap.peek().is_some_and(|max| distance < max.distance);
+
+                if should_insert {
+                    let row_idx: u64 = row_idxs
+                        .scalar_at(i)
                         .as_primitive()
                         .typed_value()
                         .expect("row_idx should be a valid u64 value");
 
-                    let id = ids.scalar_at(i);
-                    let id = id
+                    let id = ids
+                        .scalar_at(i)
                         .as_utf8()
                         .value()
-                        .expect("id should be a valid UTF8 value");
-                    let id = id.as_str();
+                        .expect("id should be a valid UTF8 value")
+                        .as_str()
+                        .to_string();
 
+                    if heap.len() >= top_k {
+                        heap.pop();
+                    }
                     heap.push(HeapElement {
                         row_idx,
-                        id: id.to_string(),
-                        distance,
-                    });
-                } else if let Some(min) = heap.peek()
-                    && distance < min.distance
-                {
-                    let row_idx = row_idxs.scalar_at(i);
-                    let row_idx = row_idx
-                        .as_primitive()
-                        .typed_value()
-                        .expect("row_idx should be a valid u64 value");
-
-                    let id = ids.scalar_at(i);
-                    let id = id
-                        .as_utf8()
-                        .value()
-                        .expect("id should be a valid UTF8 value");
-                    let id = id.as_str();
-
-                    heap.pop();
-                    heap.push(HeapElement {
-                        row_idx,
-                        id: id.to_string(),
+                        id,
                         distance,
                     });
                 }
@@ -529,12 +549,12 @@ pub async fn read_command(config: ReadConfig) -> Result<(), Box<dyn std::error::
             .update(query_start.elapsed().as_nanos() as i64);
 
         if let Some(pbar) = &pbar {
-            _ = pbar.lock().await.update(1);
+            let _ = pbar.lock().await.update(1);
         }
     }
 
     if let Some(pbar) = &pbar {
-        _ = pbar.lock().await.close();
+        let _ = pbar.lock().await.close();
     }
 
     println!("read stage elapsed time: {:?}", read_stage_start.elapsed());
